@@ -2,7 +2,11 @@
 
 from pathlib import Path
 
-from xcode.context.compaction import compact_messages, should_auto_compact
+from xcode.context.compaction import (
+    compact_messages,
+    estimate_chars,
+    should_auto_compact,
+)
 from xcode.context.mentions import preprocess_mentions
 from xcode.context.memory import MemoryStore
 
@@ -20,6 +24,30 @@ def test_compaction() -> None:
     compacted, summary = compact_messages(messages, keep_last=4)
     assert len(compacted) == 4
     assert "user:" in summary
+
+
+def test_compaction_preserves_tool_pairs() -> None:
+    messages = [
+        {"role": "user", "content": "u0"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "Read", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "file"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "done"},
+    ]
+    # keep_last=2 会切到 tool 附近；应把 assistant+tool 整组保留或整组摘要掉
+    compacted, summary = compact_messages(messages, keep_last=2)
+    assert not (compacted and compacted[0].get("role") == "tool")
+    assert "tools=Read" in summary or "assistant:tools" in summary or len(compacted) >= 2
+
+
+def test_compaction_char_threshold() -> None:
+    messages = [{"role": "user", "content": "x" * 1000} for _ in range(5)]
+    assert estimate_chars(messages) >= 5000
+    assert should_auto_compact(messages, threshold_turns=100, threshold_chars=4000)
 
 
 def test_memory(tmp_path: Path) -> None:

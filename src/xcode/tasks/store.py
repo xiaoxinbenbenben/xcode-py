@@ -1,15 +1,16 @@
-"""任务系统 MVP：持久化任务图 + TaskRun 一次性子任务记录。"""
+"""任务系统 MVP：持久化任务图 + TaskRun 占位（不扩展编排）。"""
 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from xcode.tools.base import Tool, ToolContext, ToolResult
+from xcode.tools.base import Tool, ToolContext, ToolResponse, failure, success, timed_ms
 
 
 def _utc_now() -> str:
@@ -48,7 +49,8 @@ class TaskCreateTool(Tool):
         "required": ["title"],
     }
 
-    def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResponse:
+        started = time.perf_counter()
         store = TaskStore.load(ctx.session_data_dir)
         task = {
             "id": f"task-{uuid4().hex[:10]}",
@@ -60,7 +62,7 @@ class TaskCreateTool(Tool):
         }
         store.tasks.append(task)
         store.save()
-        return ToolResult(ok=True, summary=task["id"], data=task)
+        return success(ctx, args, text=json.dumps(task, ensure_ascii=False), summary=task["id"], data=task, time_ms=timed_ms(started))
 
 
 class TaskUpdateTool(Tool):
@@ -76,7 +78,8 @@ class TaskUpdateTool(Tool):
         "required": ["id"],
     }
 
-    def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResponse:
+        started = time.perf_counter()
         store = TaskStore.load(ctx.session_data_dir)
         for task in store.tasks:
             if task["id"] == args["id"]:
@@ -86,8 +89,8 @@ class TaskUpdateTool(Tool):
                     task["title"] = str(args["title"])
                 task["updated_at"] = _utc_now()
                 store.save()
-                return ToolResult(ok=True, summary="updated", data=task)
-        return ToolResult(ok=False, summary="task not found")
+                return success(ctx, args, text=json.dumps(task, ensure_ascii=False), summary="updated", data=task, time_ms=timed_ms(started))
+        return failure(ctx, args, code="NOT_FOUND", message="task not found", time_ms=timed_ms(started))
 
 
 class TaskListTool(Tool):
@@ -95,13 +98,11 @@ class TaskListTool(Tool):
     description = "List durable tasks."
     parameters = {"type": "object", "properties": {}}
 
-    def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResponse:
+        started = time.perf_counter()
         store = TaskStore.load(ctx.session_data_dir)
-        return ToolResult(
-            ok=True,
-            summary=f"{len(store.tasks)} tasks",
-            content=json.dumps(store.tasks, ensure_ascii=False, indent=2),
-        )
+        text = json.dumps(store.tasks, ensure_ascii=False, indent=2)
+        return success(ctx, args, text=text, summary=f"{len(store.tasks)} tasks", time_ms=timed_ms(started))
 
 
 class TaskGetTool(Tool):
@@ -113,17 +114,18 @@ class TaskGetTool(Tool):
         "required": ["id"],
     }
 
-    def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResponse:
+        started = time.perf_counter()
         store = TaskStore.load(ctx.session_data_dir)
         for task in store.tasks:
             if task["id"] == args["id"]:
-                return ToolResult(ok=True, summary=task["id"], data=task)
-        return ToolResult(ok=False, summary="task not found")
+                return success(ctx, args, text=json.dumps(task, ensure_ascii=False), summary=task["id"], data=task, time_ms=timed_ms(started))
+        return failure(ctx, args, code="NOT_FOUND", message="task not found", time_ms=timed_ms(started))
 
 
 class TaskRunTool(Tool):
     name = "TaskRun"
-    description = "Record a one-shot analysis sub-task prompt (MVP: store only)."
+    description = "Record a one-shot analysis sub-task prompt (MVP placeholder; no subagent)."
     parameters = {
         "type": "object",
         "properties": {
@@ -133,8 +135,9 @@ class TaskRunTool(Tool):
         "required": ["prompt"],
     }
 
-    def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        # MVP：记录子任务意图，完整子代理循环可后续扩展
+    def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResponse:
+        # 占位：只落盘意图，不跑子代理（Team/Background 后续再对齐）
+        started = time.perf_counter()
         store = TaskStore.load(ctx.session_data_dir)
         task = {
             "id": f"run-{uuid4().hex[:10]}",
@@ -147,7 +150,7 @@ class TaskRunTool(Tool):
         }
         store.tasks.append(task)
         store.save()
-        return ToolResult(ok=True, summary=task["id"], data=task)
+        return success(ctx, args, text=json.dumps(task, ensure_ascii=False), summary=task["id"], data=task, time_ms=timed_ms(started))
 
 
 def task_tools() -> list[Tool]:

@@ -65,6 +65,8 @@ class SessionRuntime:
     messages: list[dict[str, Any]] = field(default_factory=list)
     todos: list[dict[str, str]] = field(default_factory=list)
     summary: str | None = None
+    # 相对路径 → snapshot dict，供 Edit/Write 乐观锁跨轮次生效
+    snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
     data_dir: Path = field(default_factory=Path)
 
     @property
@@ -101,6 +103,7 @@ class SessionRuntime:
             "messages": self.messages,
             "todos": self.todos,
             "summary": self.summary,
+            "snapshots": self.snapshots,
         }
         (self.data_dir / "state.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -172,6 +175,7 @@ class SessionStore:
             messages=list(state.get("messages") or []),
             todos=list(state.get("todos") or []),
             summary=state.get("summary"),
+            snapshots=dict(state.get("snapshots") or {}),
             data_dir=data_dir,
         )
 

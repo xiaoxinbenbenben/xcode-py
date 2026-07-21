@@ -1,4 +1,4 @@
-"""Hooks 注册表 MVP：在关键生命周期点触发回调。"""
+"""Hooks 注册表与默认生命周期钩子。"""
 
 from __future__ import annotations
 
@@ -27,3 +27,20 @@ class HookRegistry:
     def run(self, event: HookEvent, payload: dict[str, Any]) -> None:
         for fn in self._hooks.get(event, []):
             fn(payload)
+
+
+def build_default_hooks(*, trace_log: Callable[[dict[str, Any]], None] | None = None) -> HookRegistry:
+    """构建默认 hooks：在关键生命周期点写入可选 trace 回调。"""
+    registry = HookRegistry()
+    if trace_log is None:
+        return registry
+
+    def _wrap(event: HookEvent) -> HookFn:
+        def _fn(payload: dict[str, Any]) -> None:
+            trace_log({"hook": event.value, **payload})
+
+        return _fn
+
+    for ev in HookEvent:
+        registry.on(ev, _wrap(ev))
+    return registry

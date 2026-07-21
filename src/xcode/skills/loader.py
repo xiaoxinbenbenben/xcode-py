@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from xcode.tools.base import Tool, ToolContext, ToolResult
+from xcode.tools.base import Tool, ToolContext, ToolResponse, failure, success, timed_ms
 
 
 @dataclass(slots=True)
@@ -20,7 +21,7 @@ class Skill:
 def load_skills(roots: list[Path]) -> list[Skill]:
     """从多个根目录加载 skill。
 
-    约定：每个子目录含 SKILL.md；首段 frontmatter/首行作描述。
+    约定：每个子目录含 SKILL.md；首段非标题行作描述。
     """
     skills: list[Skill] = []
     seen: set[str] = set()
@@ -60,15 +61,22 @@ class SkillTool(Tool):
     def __init__(self, skills: list[Skill]) -> None:
         self._skills = {s.name: s for s in skills}
 
-    def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResponse:
+        started = time.perf_counter()
         action = str(args.get("action") or "load")
         if action == "list" or not args.get("name"):
             names = sorted(self._skills)
-            return ToolResult(ok=True, summary=f"{len(names)} skills", content="\n".join(names) or "(none)")
+            return success(
+                ctx,
+                args,
+                text="\n".join(names) or "(none)",
+                summary=f"{len(names)} skills",
+                time_ms=timed_ms(started),
+            )
         skill = self._skills.get(str(args["name"]))
         if skill is None:
-            return ToolResult(ok=False, summary=f"unknown skill: {args['name']}")
-        return ToolResult(ok=True, summary=skill.name, content=skill.body)
+            return failure(ctx, args, code="NOT_FOUND", message=f"unknown skill: {args['name']}", time_ms=timed_ms(started))
+        return success(ctx, args, text=skill.body, summary=skill.name, time_ms=timed_ms(started))
 
 
 def skill_roots(workspace: Path, package_skills: Path | None = None) -> list[Path]:

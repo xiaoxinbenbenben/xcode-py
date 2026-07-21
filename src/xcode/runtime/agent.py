@@ -11,14 +11,14 @@ from openai import AsyncOpenAI
 from xcode.config import Config
 from xcode.context.builder import build_context_bundle
 from xcode.context.compaction import compact_messages, should_auto_compact
-from xcode.hooks.registry import HookEvent, HookRegistry
+from xcode.hooks.registry import HookEvent, HookRegistry, build_default_hooks
 from xcode.permissions.engine import PermissionEngine
 from xcode.runtime.events import EventBuilder, new_run_id
 from xcode.runtime.session import SessionRuntime, SessionStore
 from xcode.runtime.tracing import TraceLogger
 from xcode.skills.loader import SkillTool, load_skills, skill_roots
 from xcode.tasks.store import task_tools
-from xcode.tools.base import ToolContext
+from xcode.tools.base import FileSnapshot, ToolContext
 from xcode.tools.builtins import builtin_tools
 from xcode.tools.registry import ToolRegistry
 
@@ -27,6 +27,14 @@ def build_registry(workspace, *, package_skills=None) -> ToolRegistry:
     skills = load_skills(skill_roots(workspace, package_skills))
     tools = [*builtin_tools(), *task_tools(), SkillTool(skills)]
     return ToolRegistry(tools)
+
+
+def _load_snapshots(raw: dict[str, dict[str, Any]]) -> dict[str, FileSnapshot]:
+    return {k: FileSnapshot.from_dict(v) for k, v in raw.items()}
+
+
+def _dump_snapshots(snaps: dict[str, FileSnapshot]) -> dict[str, dict[str, Any]]:
+    return {k: v.as_dict() for k, v in snaps.items()}
 
 
 async def run_agent(
@@ -40,18 +48,30 @@ async def run_agent(
     ask_permission: Callable[[str, dict[str, Any]], bool] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """执行一轮用户请求，异步产出结构化事件。"""
-    permission = permission or PermissionEngine(auto_allow=True)
-    hooks = hooks or HookRegistry()
-    if ask_permission is not None:
-        permission.ask = ask_permission
-        permission.auto_allow = False
-
     run_id = new_run_id()
     events = EventBuilder(run_id=run_id, session_id=session.session_id)
     trace = TraceLogger(
         session.data_dir / "traces" / f"{run_id}.jsonl",
         enabled=config.trace_enabled,
     )
+
+    if permission is None:
+        permission = PermissionEngine.from_settings(
+            data_home=config.data_home,
+            workspace=session.workspace_root,
+            ask=ask_permission,
+            auto_allow=ask_permission is None,
+        )
+    elif ask_permission is not None:
+        permission.ask = ask_permission
+        permission.auto_allow = False
+
+    if hooks is None:
+        hooks = build_default_hooks(
+            trace_log=(lambda payload: trace.log({"type": "hook", "payload": payload}))
+            if config.trace_enabled
+            else None
+        )
 
     def emit(event: dict[str, Any]):
         trace.log(event)
@@ -80,22 +100,26 @@ async def run_agent(
         )
     )
 
-    if should_auto_compact(session.messages, threshold_turns=config.auto_compact_turns):
+    if should_auto_compact(
+        session.messages,
+        threshold_turns=config.auto_compact_turns,
+    ):
         session.messages, session.summary = compact_messages(
             session.messages, existing_summary=session.summary
         )
         yield emit(events.build("compacted", {"reason": "auto", "kept": len(session.messages)}))
 
-    # 本轮用户消息写入会话
     session.messages.append({"role": "user", "content": bundle.mention.cleaned_input})
 
     client = AsyncOpenAI(api_key=config.api_key or "missing", base_url=config.base_url)
+    snapshots = _load_snapshots(session.snapshots)
     tool_ctx = ToolContext(
         workspace=session.workspace_root,
         session_data_dir=session.data_dir,
         todos=session.todos,
         max_output_chars=config.max_tool_output_chars,
         memory_dir=memory_dir,
+        snapshots=snapshots,
         ask_permission=lambda name, params: permission.check(name, params),
     )
 
@@ -167,14 +191,20 @@ async def run_agent(
                     hooks.run(HookEvent.BEFORE_TOOL, {"name": name, "arguments": args})
                     tool = registry.get(name)
                     if tool is None:
-                        result_obj = {
-                            "ok": False,
-                            "summary": f"unknown tool: {name}",
-                            "content": "",
-                            "truncated": False,
-                            "data": {},
-                        }
-                        content = json.dumps(result_obj, ensure_ascii=False)
+                        content = json.dumps(
+                            {
+                                "status": "error",
+                                "text": f"unknown tool: {name}",
+                                "error": {"code": "UNKNOWN_TOOL", "message": f"unknown tool: {name}"},
+                            },
+                            ensure_ascii=False,
+                        )
+                        yield emit(
+                            events.build(
+                                "tool_result",
+                                {"name": name, "ok": False, "summary": f"unknown tool: {name}", "truncated": False},
+                            )
+                        )
                     else:
                         result = tool.execute(args, tool_ctx)
                         content = result.to_message_content(max_chars=config.max_tool_output_chars)
@@ -188,12 +218,18 @@ async def run_agent(
                                     "ok": result.ok,
                                     "summary": result.summary,
                                     "truncated": result.truncated,
+                                    "status": result.status,
                                 },
                             )
                         )
                         hooks.run(
                             HookEvent.AFTER_TOOL,
-                            {"name": name, "ok": result.ok, "summary": result.summary},
+                            {
+                                "name": name,
+                                "ok": result.ok,
+                                "summary": result.summary,
+                                "status": result.status,
+                            },
                         )
                     session.messages.append(
                         {
@@ -209,7 +245,6 @@ async def run_agent(
                     yield emit(events.build("compacted", {"reason": "tool"}))
                 continue
 
-            # 无 tool_calls：普通回复结束
             if assistant_text:
                 session.messages.append({"role": "assistant", "content": assistant_text})
             yield emit(
@@ -225,6 +260,7 @@ async def run_agent(
         yield emit(events.build("error", {"message": str(exc)}))
         yield emit(events.build("run_finished", {"finish_reason": "error", "text": ""}))
     finally:
+        session.snapshots = _dump_snapshots(tool_ctx.snapshots)
         session.touch()
         session.save()
         hooks.run(HookEvent.RUN_FINISHED, {"session_id": session.session_id, "run_id": run_id})
