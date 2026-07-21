@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>xcode — 纯 Python 重建汇报</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --ink: #0a0f14;
+      --panel: #111820;
+      --line: rgba(120, 200, 160, 0.18);
+      --mist: #8b9aab;
+      --paper: #e8eef4;
+      --signal: #5dffa8;
+      --signal-dim: #2a9b68;
+      --warn: #ffb454;
+      --max: 72rem;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: "Instrument Sans", sans-serif;
+      background: var(--ink);
+      color: var(--paper);
+      line-height: 1.55;
+      overflow-x: hidden;
+    }
+
+    /* 细网格 + 径向光晕，营造终端蓝图氛围 */
+    .atmosphere {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      background:
+        radial-gradient(ellipse 80% 50% at 15% 10%, rgba(93, 255, 168, 0.08), transparent 55%),
+        radial-gradient(ellipse 60% 40% at 90% 80%, rgba(80, 140, 200, 0.07), transparent 50%),
+        linear-gradient(180deg, #0a0f14 0%, #0d141c 100%);
+    }
+    .atmosphere::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(var(--line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: radial-gradient(ellipse at center, black 20%, transparent 75%);
+      opacity: 0.55;
+      pointer-events: none;
+    }
+
+    a { color: var(--signal); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .wrap {
+      width: min(100% - 2.5rem, var(--max));
+      margin-inline: auto;
+    }
+
+    /* —— Hero：第一屏一个 composition —— */
+    .hero {
+      min-height: 100svh;
+      display: grid;
+      align-content: center;
+      padding: 4rem 0 5rem;
+      position: relative;
+    }
+
+    .brand {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: clamp(3.5rem, 12vw, 8.5rem);
+      font-weight: 500;
+      letter-spacing: -0.04em;
+      line-height: 0.92;
+      color: var(--paper);
+      animation: rise 0.9s ease both;
+    }
+    .brand span {
+      color: var(--signal);
+    }
+
+    .hero h1 {
+      font-family: "Instrument Serif", serif;
+      font-weight: 400;
+      font-size: clamp(1.35rem, 3.2vw, 2.1rem);
+      margin-top: 1.75rem;
+      max-width: 22ch;
+      color: var(--paper);
+      animation: rise 0.9s ease 0.12s both;
+    }
+
+    .hero p.lead {
+      margin-top: 1rem;
+      max-width: 38ch;
+      color: var(--mist);
+      font-size: 1.05rem;
+      animation: rise 0.9s ease 0.22s both;
+    }
+
+    .cta-row {
+      margin-top: 2.25rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.85rem 1.25rem;
+      align-items: center;
+      animation: rise 0.9s ease 0.32s both;
+    }
+
+    .btn {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.85rem;
+      padding: 0.7rem 1.15rem;
+      border: 1px solid var(--signal);
+      background: transparent;
+      color: var(--signal);
+      cursor: pointer;
+      transition: background 0.2s, color 0.2s;
+    }
+    .btn:hover {
+      background: var(--signal);
+      color: var(--ink);
+      text-decoration: none;
+    }
+    .cta-row .ghost {
+      color: var(--mist);
+      font-size: 0.9rem;
+      font-family: "IBM Plex Mono", monospace;
+    }
+
+    .hero-visual {
+      position: absolute;
+      right: max(1rem, calc((100% - var(--max)) / 2));
+      top: 50%;
+      transform: translateY(-48%);
+      width: min(42vw, 28rem);
+      aspect-ratio: 5 / 6;
+      border: 1px solid var(--line);
+      background:
+        linear-gradient(160deg, rgba(17, 24, 32, 0.9), rgba(10, 15, 20, 0.6));
+      overflow: hidden;
+      animation: fade-in 1.1s ease 0.2s both;
+      display: none;
+    }
+    @media (min-width: 900px) {
+      .hero-visual { display: block; }
+    }
+    .hero-visual pre {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.72rem;
+      line-height: 1.65;
+      padding: 1.5rem;
+      color: var(--signal-dim);
+      white-space: pre-wrap;
+    }
+    .hero-visual pre .hi { color: var(--signal); }
+    .hero-visual pre .dim { color: var(--mist); }
+    .scan {
+      position: absolute;
+      left: 0; right: 0;
+      height: 28%;
+      background: linear-gradient(transparent, rgba(93, 255, 168, 0.07), transparent);
+      animation: scan 4.5s ease-in-out infinite;
+      pointer-events: none;
+    }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(18px); }
+      to { opacity: 1; transform: none; }
+    }
+    @keyframes fade-in {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    @keyframes scan {
+      0%, 100% { top: -10%; }
+      50% { top: 80%; }
+    }
+
+    /* —— Sections —— */
+    section {
+      padding: 5.5rem 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .eyebrow {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.75rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--signal-dim);
+      margin-bottom: 0.85rem;
+    }
+
+    section h2 {
+      font-family: "Instrument Serif", serif;
+      font-weight: 400;
+      font-size: clamp(1.75rem, 3.5vw, 2.6rem);
+      margin-bottom: 0.75rem;
+      max-width: 18ch;
+    }
+
+    section .sub {
+      color: var(--mist);
+      max-width: 48ch;
+      margin-bottom: 2.25rem;
+    }
+
+    .compare {
+      display: grid;
+      gap: 1.5rem;
+    }
+    @media (min-width: 720px) {
+      .compare { grid-template-columns: 1fr 1fr; gap: 2.5rem; }
+    }
+    .compare article h3 {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.8rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--warn);
+      margin-bottom: 0.75rem;
+    }
+    .compare ul {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.55rem;
+    }
+    .compare li {
+      padding-left: 1rem;
+      border-left: 2px solid var(--line);
+      color: var(--mist);
+      font-size: 0.95rem;
+    }
+    .compare article.now li { border-left-color: var(--signal-dim); color: var(--paper); }
+
+    .matrix {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.92rem;
+    }
+    .matrix th,
+    .matrix td {
+      text-align: left;
+      padding: 0.85rem 0.6rem;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+    .matrix th {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.72rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--signal-dim);
+      font-weight: 500;
+    }
+    .matrix td:first-child { color: var(--mist); width: 38%; }
+    .matrix td:last-child { color: var(--paper); }
+
+    .cmd {
+      font-family: "IBM Plex Mono", monospace;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      padding: 1.25rem 1.35rem;
+      font-size: 0.85rem;
+      line-height: 1.7;
+      color: var(--signal);
+      overflow-x: auto;
+    }
+    .cmd .c { color: var(--mist); }
+
+    .flow {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: clamp(0.78rem, 1.6vw, 0.92rem);
+      color: var(--paper);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem 0.35rem;
+      align-items: center;
+    }
+    .flow .node {
+      border: 1px solid var(--line);
+      padding: 0.45rem 0.7rem;
+      background: rgba(17, 24, 32, 0.8);
+    }
+    .flow .arrow { color: var(--signal-dim); }
+
+    .sdd-steps {
+      display: grid;
+      gap: 1rem;
+      counter-reset: step;
+    }
+    @media (min-width: 720px) {
+      .sdd-steps { grid-template-columns: repeat(3, 1fr); }
+    }
+    .sdd-steps li {
+      list-style: none;
+      padding: 1.25rem 0 0;
+      border-top: 1px solid var(--line);
+      counter-increment: step;
+    }
+    .sdd-steps li::before {
+      content: "0" counter(step);
+      display: block;
+      font-family: "IBM Plex Mono", monospace;
+      color: var(--signal);
+      font-size: 0.8rem;
+      margin-bottom: 0.5rem;
+    }
+    .sdd-steps strong {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 0.35rem;
+    }
+    .sdd-steps span { color: var(--mist); font-size: 0.92rem; }
+
+    footer {
+      padding: 3rem 0 4rem;
+      border-top: 1px solid var(--line);
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.78rem;
+      color: var(--mist);
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .reveal {
+      opacity: 0;
+      transform: translateY(16px);
+      transition: opacity 0.6s ease, transform 0.6s ease;
+    }
+    .reveal.visible {
+      opacity: 1;
+      transform: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="atmosphere" aria-hidden="true"></div>
+
+  <header class="hero wrap">
+    <p class="brand">x<span>code</span></p>
+    <h1>把 xx-coding 收成一个纯 Python 入口</h1>
+    <p class="lead">更短的依赖链、更清楚的层次、同一条命令打开 CLI 与 TUI。</p>
+    <div class="cta-row">
+      <a class="btn" href="#run">如何运行</a>
+      <span class="ghost">OpenSpec · rebuild-xcode-pure-python</span>
+    </div>
+    <aside class="hero-visual" aria-hidden="true">
+      <div class="scan"></div>
+      <pre><span class="dim">$ </span><span class="hi">xcode</span>
+<span class="dim"># no args → TUI / REPL</span>
+
+<span class="dim">$ </span><span class="hi">xcode -p</span> "list files"
+<span class="dim"># print mode → exit</span>
+
+<span class="dim">$ </span><span class="hi">xcode doctor</span>
+<span class="dim"># subcommand → CLI</span>
+
+<span class="hi">src/xcode/</span>
+  entrypoints/
+  runtime/
+  tools/
+  context/</pre>
+    </aside>
+  </header>
+
+  <section class="wrap reveal" id="goal">
+    <p class="eyebrow">01 · Goal</p>
+    <h2>改造目标与范围</h2>
+    <p class="sub">对齐 xx-coding 核心能力，用标准包与自研 agent loop 重写；交互层改为 Python，不再维护 Node/Ink 第二入口。</p>
+    <div class="compare">
+      <article>
+        <h3>Before · xx-coding</h3>
+        <ul>
+          <li>OpenAI Agents SDK + 松散 <code>src/</code></li>
+          <li><code>scripts/cli.py</code> 与 <code>npm tui</code> 双入口</li>
+          <li>React/Ink 独立前端栈</li>
+        </ul>
+      </article>
+      <article class="now">
+        <h3>After · xcode</h3>
+        <ul>
+          <li>纯 Python 包 <code>src/xcode</code> + <code>pyproject.toml</code></li>
+          <li>单一 Typer 入口（参考 PaiCLI 模式）</li>
+          <li>prompt-toolkit + rich 作为 TUI</li>
+        </ul>
+      </article>
+    </div>
+  </section>
+
+  <section class="wrap reveal" id="align">
+    <p class="eyebrow">02 · Alignment</p>
+    <h2>功能对齐</h2>
+    <p class="sub">xx-coding 能力映射到 xcode 模块；Team/Worktree 以 MVP 可扩展点保留。</p>
+    <table class="matrix">
+      <thead>
+        <tr><th>xx-coding</th><th>xcode</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>CLI + Ink TUI</td><td>entrypoints/cli.py + tui.py</td></tr>
+        <tr><td>Session / workspace</td><td>runtime/session.py</td></tr>
+        <tr><td>Runtime events + stream</td><td>runtime/events.py + agent.py</td></tr>
+        <tr><td>LS / Glob / Grep / Read / Edit / Write / Bash / Todo</td><td>tools/builtins.py</td></tr>
+        <tr><td>Context / @file / compact / memory</td><td>context/*</td></tr>
+        <tr><td>Tasks / Skills / Permissions / Hooks</td><td>tasks / skills / permissions / hooks</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="wrap reveal" id="entry">
+    <p class="eyebrow">03 · Single Entry</p>
+    <h2>一个入口，三种姿态</h2>
+    <p class="sub">无子命令进入交互；<code>-p</code> 单次运行；具名子命令留在 CLI。不再分发两套启动脚本。</p>
+    <div class="flow" aria-label="调用链">
+      <span class="node">xcode / python -m xcode</span>
+      <span class="arrow">→</span>
+      <span class="node">entrypoints.cli</span>
+      <span class="arrow">→</span>
+      <span class="node">tui | -p | session/doctor</span>
+      <span class="arrow">→</span>
+      <span class="node">runtime.agent</span>
+      <span class="arrow">→</span>
+      <span class="node">tools + context</span>
+    </div>
+  </section>
+
+  <section class="wrap reveal" id="run">
+    <p class="eyebrow">04 · Run</p>
+    <h2>目录与启动</h2>
+    <p class="sub">包路径 <code>src/xcode/</code>；数据默认落在 <code>~/.xcode/</code>。先同步依赖，再 doctor，再进入 TUI。</p>
+    <pre class="cmd"><span class="c"># 安装</span>
+uv sync --extra dev
+
+<span class="c"># 配置 .env（见 .env.example）后</span>
+uv run xcode doctor
+uv run xcode
+uv run xcode -p "列出项目结构"
+uv run pytest</pre>
+  </section>
+
+  <section class="wrap reveal" id="sdd">
+    <p class="eyebrow">05 · SDD</p>
+    <h2>OpenSpec 过程</h2>
+    <p class="sub">Change：<code>rebuild-xcode-pure-python</code>，产物在 <code>openspec/changes/rebuild-xcode-pure-python/</code>。</p>
+    <ol class="sdd-steps">
+      <li><strong>Propose</strong><span>proposal / design / specs / tasks 一次生成</span></li>
+      <li><strong>Apply</strong><span>按 tasks 实现包、测试与入口</span></li>
+      <li><strong>Report</strong><span>本页汇总架构与运行方式</span></li>
+    </ol>
+  </section>
+
+  <footer class="wrap">
+    <span>xcode 0.1.0 · pure Python rebuild</span>
+    <span>tests: 11 passed</span>
+  </footer>
+
+  <script>
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting) e.target.classList.add("visible");
+        }
+      },
+      { threshold: 0.12 }
+    );
+    document.querySelectorAll(".reveal").forEach((el) => io.observe(el));
+  </script>
+</body>
+</html>
