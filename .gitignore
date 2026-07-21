@@ -13,3 +13,7 @@ artifacts/
 .xcode/
 node_modules/
 uv.lock
+
+# Reference clones — do not publish
+PaiCLI-Python/
+xx-coding/

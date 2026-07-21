@@ -1,0 +1,43 @@
+[project]
+name = "xcode"
+version = "0.1.0"
+description = "Pure-Python local coding agent — single-entry rebuild of xx-coding"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "xcode contributors" }]
+dependencies = [
+  "openai>=1.60.0",
+  "prompt-toolkit>=3.0.43",
+  "python-dotenv>=1.0.0",
+  "rich>=13.7.0",
+  "typer>=0.12.3",
+]
+
+[project.scripts]
+xcode = "xcode.entrypoints.cli:app"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "ruff>=0.5.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xcode"]
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
