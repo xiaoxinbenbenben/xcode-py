@@ -11,6 +11,7 @@ build/
 *.egg-info/
 artifacts/
 .xcode/
+.tmp-xcode-home/
 node_modules/
 uv.lock
 

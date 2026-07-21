@@ -20,7 +20,7 @@ from xcode.runtime.session import SessionStore
 
 app = typer.Typer(
     name="xcode",
-    help="xcode — pure-Python local coding agent (single entry)",
+    help="xcode — local coding agent · 无参进 TUI · -p 单次 · 子命令管理",
     invoke_without_command=True,
     no_args_is_help=False,
 )

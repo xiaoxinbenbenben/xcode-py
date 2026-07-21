@@ -1,8 +1,9 @@
-"""入口路由烟雾测试（不真正调模型）。"""
+"""TUI 辅助与入口烟雾。"""
 
 from typer.testing import CliRunner
 
 from xcode.entrypoints.cli import app
+from xcode.entrypoints.tui import SLASH_COMMANDS
 
 runner = CliRunner()
 
@@ -27,3 +28,8 @@ def test_session_new_and_list(tmp_path, monkeypatch) -> None:
     assert sid.startswith("sess-")
     listed = runner.invoke(app, ["session", "list", "--workspace", str(tmp_path)])
     assert sid in listed.stdout
+
+
+def test_slash_commands_cover_basics() -> None:
+    for name in ("/help", "/exit", "/tools", "/status", "/compact"):
+        assert name in SLASH_COMMANDS

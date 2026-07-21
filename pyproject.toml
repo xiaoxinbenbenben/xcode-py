@@ -1,6 +1,6 @@
 [project]
 name = "xcode"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pure-Python local coding agent — single-entry rebuild of xx-coding"
 readme = "README.md"
 requires-python = ">=3.12"
