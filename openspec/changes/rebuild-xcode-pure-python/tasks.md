@@ -29,5 +29,5 @@
 ## 6. Tests, docs, report
 
 - [x] 6.1 编写并跑通基础单元测试（session、tools、entry 路由、mentions）
-- [ ] 6.2 用 frontend-design 编写 `docs/report/index.html` 汇报页
-- [ ] 6.3 分阶段 git commit（scaffolding / core / entry / report）
+- [x] 6.2 用 frontend-design 编写 `docs/report/index.html` 汇报页
+- [x] 6.3 分阶段 git commit（scaffolding / core / entry / report）
