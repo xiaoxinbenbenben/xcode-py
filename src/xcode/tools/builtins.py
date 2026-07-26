@@ -85,6 +85,9 @@ def resolve_readable_path(ctx: ToolContext, raw: str) -> Path:
         return path
 
 
+# --- 只读：列表 / 匹配 / 搜索 / 读文件 ---
+
+
 class LSTool(Tool):
     name = "LS"
     description = "List files and directories under a workspace-relative path."
@@ -229,6 +232,9 @@ class ReadTool(Tool):
         )
 
 
+# --- 写入：Edit / Write ---
+
+
 class EditTool(Tool):
     name = "Edit"
     description = "Replace an exact string occurrence in a file. Uses Read snapshot as optimistic lock."
@@ -311,6 +317,9 @@ class WriteTool(Tool):
         )
 
 
+# --- 执行：Bash ---
+
+
 class BashTool(Tool):
     name = "Bash"
     description = "Run a shell command in the workspace directory."
@@ -391,6 +400,9 @@ class BashTool(Tool):
                 data={"exit_code": proc.returncode},
             )
         return success(ctx, args, text=out, summary=summary, time_ms=elapsed)
+
+
+# --- 会话辅助：Todo / Compact ---
 
 
 class TodoWriteTool(Tool):

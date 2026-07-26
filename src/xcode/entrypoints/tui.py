@@ -112,7 +112,8 @@ async def start_tui(
     store: SessionStore,
     ask_permission: Callable[[str, dict[str, Any]], bool] | None = None,
 ) -> None:
-    """启动交互 REPL（产品向 Python TUI）。"""
+    """启动交互 REPL：读输入 → slash 或 run_agent → 渲染事件。"""
+    # --- 1) 终端与输入控件 ---
     console = Console()
     history_path = config.data_home / "prompt_history.txt"
     history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,6 +131,7 @@ async def start_tui(
         placeholder=[("class:placeholder", "描述任务，或 /help…")],
     )
 
+    # --- 2) 主循环：slash 本地处理，否则交给 agent ---
     while True:
         try:
             text = await prompt.prompt_async(
@@ -225,29 +227,34 @@ async def _handle_slash(
 
 
 def _render_event(console: Console, event: dict[str, Any]) -> None:
+    """把一条产品事件画到终端。
+
+    输入：扁平事件 dict；副作用：向 console 打印（text/thinking 不换行）。
+    """
     et = event.get("type")
-    payload = event.get("payload") or {}
     if et == "text_delta":
-        console.print(payload.get("text", ""), end="")
+        console.print(event.get("text", ""), end="")
+    elif et == "thinking_delta":
+        console.print(Text(str(event.get("thinking") or ""), style="dim italic"), end="")
     elif et == "tool_call":
-        args = payload.get("arguments") or {}
+        args = event.get("input") or {}
         preview = json.dumps(args, ensure_ascii=False)
         if len(preview) > 120:
             preview = preview[:117] + "…"
         console.print()
-        console.print(Text(f"⚙ {payload.get('name')}", style="bold #5dffa8"), end=" ")
+        console.print(Text(f"⚙ {event.get('name')}", style="bold #5dffa8"), end=" ")
         console.print(Text(preview, style="dim"))
     elif et == "tool_result":
-        ok = payload.get("ok")
-        flag = "ok" if ok else "err"
-        style = "#2a9b68" if ok else "#ffb454"
-        console.print(Text(f"  ↳ {flag}: {payload.get('summary')}", style=style))
+        is_error = bool(event.get("is_error"))
+        flag = "err" if is_error else "ok"
+        style = "#ffb454" if is_error else "#2a9b68"
+        result = str(event.get("result") or "")
+        summary = result if len(result) <= 160 else result[:157] + "…"
+        console.print(Text(f"  ↳ {flag}: {summary}", style=style))
     elif et == "error":
         console.print()
-        console.print(Text(f"error: {payload.get('message')}", style="bold red"))
-    elif et == "compacted":
-        console.print(Text(f"\n⋯ compacted ({payload.get('reason')})", style="dim"))
-    elif et == "run_finished":
+        console.print(Text(f"error: {event.get('error')}", style="bold red"))
+    elif et == "done":
         console.print()
 
 
@@ -259,7 +266,10 @@ async def run_once(
     store: SessionStore,
     json_events: bool = False,
 ) -> int:
-    """非交互单次运行；json_events 时打印 JSONL。"""
+    """跑一次 `-p`：消费 run_agent 事件并打印。
+
+    输入：用户 prompt；输出：退出码（出现 error 则为 1）。
+    """
     console = Console()
     code = 0
     async for event in run_agent(prompt, config=config, session=session, store=store):

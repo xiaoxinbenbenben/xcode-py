@@ -106,9 +106,12 @@ class PermissionEngine:
         return cls(rules=rules, ask=ask, auto_allow=auto_allow)
 
     def evaluate(self, tool_name: str, params: dict[str, Any]) -> PermissionResult:
+        """判定工具调用：hard deny → 规则 → 默认策略。不弹 HITL。"""
+        # --- 1) 硬拒绝（不可被规则放行） ---
         hard = self._hard_deny(tool_name, params)
         if hard:
             return hard
+        # --- 2) 命中 settings 规则 ---
         rule = self._best_rule(tool_name, params)
         if rule is not None:
             return PermissionResult(
@@ -116,6 +119,7 @@ class PermissionEngine:
                 reason=rule.reason or f"命中 {rule.scope} 规则",
                 source=f"rule:{rule.scope}",
             )
+        # --- 3) 内置默认：只读放行 / 敏感询问 ---
         if tool_name in READ_ONLY_ALLOW:
             return PermissionResult("allow", "只读默认放行", "default")
         if tool_name in ASK_BY_DEFAULT:
@@ -123,13 +127,15 @@ class PermissionEngine:
         return PermissionResult("allow", "默认放行", "default")
 
     def check(self, tool_name: str, params: dict[str, Any]) -> bool:
-        """供工具回调：True 放行。hard deny 与 deny 规则不可被 auto_allow 绕过。"""
+        """供工具回调：True 放行。
+
+        deny 不可被 auto_allow 绕过；ask 在 auto_allow 或用户确认后放行。
+        """
         result = self.evaluate(tool_name, params)
         if result.decision == "deny":
             return False
         if result.decision == "allow":
             return True
-        # ask
         if self.auto_allow:
             return True
         if self.ask is None:

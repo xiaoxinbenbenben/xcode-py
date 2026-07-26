@@ -1,33 +1,41 @@
-"""结构化 runtime 事件，供 CLI/TUI 统一消费。"""
+"""产品事件：扁平 dict（type + 字段），给 CLI/TUI 消费。"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Final
 from uuid import uuid4
 
+TEXT_DELTA: Final = "text_delta"
+THINKING_DELTA: Final = "thinking_delta"
+USAGE: Final = "usage"
+TURN_COMPLETE: Final = "turn_complete"
+TOOL_CALL: Final = "tool_call"
+TOOL_RESULT: Final = "tool_result"
+ERROR: Final = "error"
+DONE: Final = "done"
 
-def _utc_now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+def make_event(event_type: str, **fields: Any) -> dict[str, Any]:
+    """拼一条产品事件。
+
+    输入：事件类型 + 顶层字段；输出：`{"type": event_type, ...fields}`。
+    """
+    return {"type": event_type, **fields}
 
 
-@dataclass(slots=True)
-class EventBuilder:
-    """按 run 生成带公共字段的事件字典。"""
-
-    run_id: str
-    session_id: str
-
-    def build(self, event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        return {
-            "type": event_type,
-            "run_id": self.run_id,
-            "session_id": self.session_id,
-            "ts": _utc_now(),
-            "payload": payload or {},
-        }
+def map_finish_reason(reason: str | None) -> str:
+    """把 API 的 finish_reason 收成产品层 stop_reason。"""
+    if reason in {"tool_calls", "tool_use"}:
+        return "tool_use"
+    if reason == "length":
+        return "max_tokens"
+    if reason == "content_filter":
+        return "stop_sequence"
+    if reason in {None, "", "stop"}:
+        return "end_turn"
+    return str(reason)
 
 
 def new_run_id() -> str:
+    """生成 trace 用的 run id（不进入产品事件）。"""
     return f"run-{uuid4().hex[:12]}"

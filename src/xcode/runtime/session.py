@@ -198,12 +198,17 @@ class SessionStore:
         session_id: str | None = None,
         new_session: bool = False,
     ) -> SessionRuntime:
-        """按 CLI 参数解析应使用的会话。"""
+        """按 CLI 参数解析应使用的会话。
+
+        优先级：强制新建 → 指定 id → current 指针 → 最近会话 → 新建。
+        """
         workspace = workspace.resolve()
+        # --- 1) 显式参数 ---
         if new_session:
             return self.create(workspace)
         if session_id:
             return self.load(workspace, session_id)
+        # --- 2) 项目下 current_session 指针 ---
         pointer = self.sessions_dir(workspace) / "current_session.json"
         if pointer.is_file():
             data = json.loads(pointer.read_text(encoding="utf-8"))
@@ -213,6 +218,7 @@ class SessionStore:
                     return self.load(workspace, sid)
                 except FileNotFoundError:
                     pass
+        # --- 3) 回落：最近一条或新建 ---
         existing = self.list_sessions(workspace)
         if existing:
             return self.load(workspace, existing[0].session_id)

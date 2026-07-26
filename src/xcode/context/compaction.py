@@ -83,11 +83,14 @@ def compact_messages(
     输入：完整 messages、保留条数、已有 summary。
     输出：(压缩后 messages, 新 summary)。本地启发式，不调模型。
     """
+    # --- 1) 找安全切点（不拆散 assistant+tool 组） ---
     cut = _find_safe_cut(messages, keep_last)
     if cut <= 0:
         return list(messages), existing_summary or ""
 
     older, recent = messages[:cut], messages[cut:]
+
+    # --- 2) 把 older 压成可读 summary 行 ---
     lines: list[str] = []
     tool_names: list[str] = []
     user_n = assistant_n = tool_n = 0
@@ -107,6 +110,7 @@ def compact_messages(
         if line:
             lines.append(line)
 
+    # --- 3) 拼 summary，recent 原样保留 ---
     header = (
         f"[compacted {len(older)} msgs: user={user_n} assistant={assistant_n} "
         f"tool={tool_n}; tools={','.join(sorted(set(tool_names))[:12]) or '-'}]"

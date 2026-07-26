@@ -1,6 +1,6 @@
 # xcode — pure-Python local coding agent
 
-xx-coding 的纯 Python 重建版：标准包 `xcode`，**单一入口**（CLI + TUI/REPL）。
+标准包 `xcode`，**单一入口**（CLI + TUI/REPL）。
 
 ## 安装
 
@@ -34,21 +34,3 @@ uv run xcode doctor
 uv run xcode session list
 uv run xcode session new --workspace /path/to/project
 ```
-
-## 与 xx-coding 的差异
-
-| xx-coding | xcode |
-|-----------|-------|
-| `scripts/cli.py` + `npm tui` 双入口 | 统一 `xcode` |
-| OpenAI Agents SDK | 自研 agent loop |
-| React/Ink TUI | prompt-toolkit + rich |
-
-## 测试
-
-```bash
-uv run pytest
-```
-
-## 汇报页
-
-打开 [`docs/report/index.html`](docs/report/index.html)。
