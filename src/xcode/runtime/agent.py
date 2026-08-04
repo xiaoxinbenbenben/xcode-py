@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from openai import AsyncOpenAI
 
+from xcode.audit import append_audit
 from xcode.config import Config
 from xcode.context.builder import build_context_bundle
 from xcode.runtime.events import (
@@ -72,6 +73,36 @@ def _parse_tool_input(raw: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {"value": parsed}
 
 
+async def _approved(tool_ctx: ToolContext, name: str, args: dict[str, Any]) -> bool:
+    """询问用户是否批准高危工具执行；无回调（非交互）默认拒绝。"""
+    if tool_ctx.ask_permission is None:
+        return False
+    preview = json.dumps(args, ensure_ascii=False)[:200]
+    return await tool_ctx.ask_permission(f"允许工具 {name} 执行？参数：{preview}")
+
+
+def _audit(
+    tool_ctx: ToolContext,
+    session: SessionRuntime,
+    *,
+    name: str,
+    args: dict[str, Any],
+    approved: bool,
+    is_error: bool,
+) -> None:
+    """工具执行落审计；data_home 未注入时跳过。"""
+    if tool_ctx.data_home is None:
+        return
+    append_audit(
+        tool_ctx.data_home,
+        session_id=session.session_id,
+        tool=name,
+        args=args,
+        approved=approved,
+        is_error=is_error,
+    )
+
+
 async def _iter_tool_executions(
     *,
     ordered_calls: list[dict[str, Any]],
@@ -82,6 +113,7 @@ async def _iter_tool_executions(
     """执行本轮 tool_calls。
 
     输出：依次 yield `tool_call` / `tool_result`；副作用：追加纯文本 tool 消息。
+    #8：requires_approval 工具先过审批，拒绝则报 permission denied；每次执行写审计。
     """
     for tc in ordered_calls:
         name = tc["function"]["name"]
@@ -93,9 +125,22 @@ async def _iter_tool_executions(
             content = f"unknown tool: {name}"
             is_error = True
         else:
-            result = await tool.execute(args, tool_ctx)
-            content = result.text
-            is_error = result.is_error
+            approved = not tool.requires_approval or await _approved(tool_ctx, name, args)
+            if approved:
+                result = await tool.execute(args, tool_ctx)
+                content = result.text
+                is_error = result.is_error
+            else:
+                content = f"permission denied: {name}"
+                is_error = True
+            _audit(
+                tool_ctx,
+                session,
+                name=name,
+                args=args,
+                approved=approved,
+                is_error=is_error,
+            )
 
         yield make_event(TOOL_RESULT, name=name, result=content, is_error=is_error)
         session.messages.append(
@@ -110,10 +155,12 @@ async def run_agent(
     session: SessionRuntime,
     store: SessionStore,
     client: Any | None = None,
+    ask_permission: Callable[[str], Awaitable[bool]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """跑完一次用户请求的 ReAct，并流式产出产品事件。
 
-    输入：用户文本 + 会话/配置；可选注入 `client`（测试用）。
+    输入：用户文本 + 会话/配置；可选注入 `client`（测试用）、
+    `ask_permission`（#8 审批回调，缺省 None = 非交互直接拒绝高危工具）。
     输出：异步迭代扁平事件；副作用：改写并保存 session。
     """
     _ = store
@@ -129,7 +176,11 @@ async def run_agent(
     session.messages.append({"role": "user", "content": bundle.user_text})
 
     llm = client or AsyncOpenAI(api_key=config.api_key or "missing", base_url=config.base_url)
-    tool_ctx = ToolContext(workspace=session.workspace_root)
+    tool_ctx = ToolContext(
+        workspace=session.workspace_root,
+        data_home=config.data_home,
+        ask_permission=ask_permission,
+    )
 
     # --- 2) ReAct 多轮：LLM ↔ 工具 ---
     max_rounds = 24

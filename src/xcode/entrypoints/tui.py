@@ -150,11 +150,23 @@ async def start_tui(
             continue
 
         console.print(Text("── agent ──", style="dim #2a9b68"))
+
+        async def _ask_permission(text: str) -> bool:
+            """#8 审批回调：TUI 内 y/N 确认；Ctrl-C 视为拒绝。"""
+            try:
+                answer = await prompt.prompt_async(
+                    HTML(f"<b><style fg='#ffb454'>⚠ {text} [y/N] </style></b>")
+                )
+            except (EOFError, KeyboardInterrupt):
+                return False
+            return answer.strip().lower() in {"y", "yes"}
+
         async for event in run_agent(
             text,
             config=config,
             session=session,
             store=store,
+            ask_permission=_ask_permission,
         ):
             _render_event(console, event)
         turns = sum(1 for m in session.messages if m.get("role") == "user")

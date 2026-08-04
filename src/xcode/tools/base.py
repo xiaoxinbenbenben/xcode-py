@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,9 +11,15 @@ from typing import Any
 
 @dataclass(slots=True)
 class ToolContext:
-    """工具执行上下文；目前仅 workspace。"""
+    """工具执行上下文。
+
+    workspace 必填；data_home / ask_permission 由运行时注入
+    （#8 安全策略：审批回调缺省为 None = 非交互直接拒绝）。
+    """
 
     workspace: Path
+    data_home: Path | None = None
+    ask_permission: Callable[[str], Awaitable[bool]] | None = None
 
 
 @dataclass(slots=True)
@@ -31,6 +38,7 @@ class Tool(ABC):
     name: str
     description: str
     parameters: dict[str, Any]
+    requires_approval: bool = False
 
     def openai_schema(self) -> dict[str, Any]:
         return {
