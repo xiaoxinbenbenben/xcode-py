@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-from pathlib import Path
 from typing import Any, Callable
 
 from prompt_toolkit import PromptSession
@@ -32,7 +30,6 @@ SLASH_COMMANDS = [
     "/clear",
     "/tools",
     "/status",
-    "/compact",
 ]
 
 # 工业蓝图：深底 + 信号绿强调，克制层次
@@ -110,7 +107,6 @@ async def start_tui(
     config: Config,
     session: SessionRuntime,
     store: SessionStore,
-    ask_permission: Callable[[str, dict[str, Any]], bool] | None = None,
 ) -> None:
     """启动交互 REPL：读输入 → slash 或 run_agent → 渲染事件。"""
     # --- 1) 终端与输入控件 ---
@@ -159,7 +155,6 @@ async def start_tui(
             config=config,
             session=session,
             store=store,
-            ask_permission=ask_permission,
         ):
             _render_event(console, event)
         turns = sum(1 for m in session.messages if m.get("role") == "user")
@@ -194,32 +189,19 @@ async def _handle_slash(
         return False
     if cmd == "/clear":
         session.messages.clear()
-        session.summary = None
         session.save()
         console.print("[dim]cleared conversation[/]")
         return False
     if cmd == "/tools":
         names = build_registry(session.workspace_root).list_names()
-        console.print(", ".join(names))
+        console.print(", ".join(names) if names else "(none)")
         return False
     if cmd == "/status":
         table = Table(show_header=False, box=None, padding=(0, 1))
         table.add_row("model", config.model)
         table.add_row("session", session.session_id)
         table.add_row("messages", str(len(session.messages)))
-        table.add_row("todos", str(len(session.todos)))
-        table.add_row("snapshots", str(len(session.snapshots)))
-        table.add_row("summary", "yes" if session.summary else "no")
         console.print(table)
-        return False
-    if cmd == "/compact":
-        from xcode.context.compaction import compact_messages
-
-        session.messages, session.summary = compact_messages(
-            session.messages, existing_summary=session.summary
-        )
-        session.save()
-        console.print(f"[dim]compacted → {len(session.messages)} messages kept[/]")
         return False
     console.print(f"[yellow]unknown command:[/] {cmd}  (try /help)")
     _ = arg

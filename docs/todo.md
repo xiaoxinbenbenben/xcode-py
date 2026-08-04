@@ -7,7 +7,8 @@
 
 3. **LLM Provider** — OpenAI-compatible 流式、多 provider key、能力探测
 4. **ReAct Loop** — 主循环、多轮 tool、停止条件
-5. **Prompt 组装** — 系统提示、工具说明、项目记忆文件（`PAI.md` 等）
+5. **Prompt 组装** — 系统提示、工具说明、项目记忆文件（根目录 `XCODE.md` + `XCODE.local.md`）
+   - 本轮不做、回头挂靠：Skill 索引→**13**；SQLite 长期记忆→**11**（现仍 JSONL）；工具改名文案→**7**；summary/mention 从 system 收口→**6**
 6. **上下文治理** — 窗口预算、历史裁剪/压缩、@file / mention 注入、侧车历史与 Loop 的交接
 7. **工具体系** — Registry / 执行器 / 结果模型；内置工具为内容包（不另开方面）：
    * 工作区：读/写/列表/glob/grep/bash
@@ -16,6 +17,7 @@
    * 联网：`web_search` / `web_fetch`
    * 代码检索：`search_code`（可接轻量索引）
    * 恢复：`revert_turn`
+   * 进度：旧 xx 血统工具已清空；运行时已收成 todo **1–5** 核心（6+ 模块从树里移除待回填）
 8. **安全策略** — PathGuard、CommandGuard、HITL、审计日志落盘
 9. **Hooks** — turn/tool 前后（及错误）回调：可观察、可拦截、可打点；与事件协议、审计衔接
 
@@ -92,7 +94,7 @@
 | **2** | 事件类型与字段定稿，入口只认这一套 ✅ |
 | **3** | OpenAI-compatible 流式可用；按配置创建客户端 |
 | **4** | 纯 ReAct 多轮 tool，停止条件明确 |
-| **5** | 系统提示含 cwd/工具/项目说明文件 |
+| **5** | 系统提示含 cwd/工具/项目说明（`XCODE.md` + `XCODE.local.md`） ✅ |
 | **6** | 长对话可控（预算/压缩/mention 生效） |
 | **7** | Registry/执行器就绪；工作区+Bash 能读改跑；其它工具作内容包可挂 |
 | **8** | 危险路径/命令可拦；HITL/审计可落盘 |
@@ -121,5 +123,5 @@
 | `save_memory` / `load_skill` | Tools 入口在 **7**；后端分别靠 **11**、**13** |
 | 审计 JSONL | **8** 落盘；**23** 做展示 |
 | Hooks 与追踪 | **9** 埋钩子；**23** 消费事件做可视化 |
-| 上下文治理 vs Prompt | **5** 负责「组什么」；**6** 负责「塞多少、何时压缩」 |
+| 上下文治理 vs Prompt | **5** 负责「组什么」（`XCODE.md`）；**6** 负责「塞多少、何时压缩」；summary/mention 现暂留 system，收口归 **6** |
 | 最小 `-p` 冒烟 | 正式收口在 **20**；**4/7** 落地后可先薄挂入口做验收，不另开方面 |

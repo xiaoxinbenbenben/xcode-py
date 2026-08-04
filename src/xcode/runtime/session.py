@@ -59,14 +59,10 @@ class SessionMeta:
 
 @dataclass
 class SessionRuntime:
-    """单个会话的内存视图：元数据 + 对话消息 + 辅助状态。"""
+    """单个会话的内存视图：元数据 + 对话消息。"""
 
     meta: SessionMeta
     messages: list[dict[str, Any]] = field(default_factory=list)
-    todos: list[dict[str, str]] = field(default_factory=list)
-    summary: str | None = None
-    # 相对路径 → snapshot dict，供 Edit/Write 乐观锁跨轮次生效
-    snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
     data_dir: Path = field(default_factory=Path)
 
     @property
@@ -99,12 +95,7 @@ class SessionRuntime:
             json.dumps(self.meta.as_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        payload = {
-            "messages": self.messages,
-            "todos": self.todos,
-            "summary": self.summary,
-            "snapshots": self.snapshots,
-        }
+        payload = {"messages": self.messages}
         (self.data_dir / "state.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -127,11 +118,6 @@ class SessionStore:
 
     def sessions_dir(self, workspace: Path) -> Path:
         path = self._project_dir(workspace) / "sessions"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def memory_dir(self, workspace: Path) -> Path:
-        path = self._project_dir(workspace) / "memory"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -173,9 +159,6 @@ class SessionStore:
         return SessionRuntime(
             meta=meta,
             messages=list(state.get("messages") or []),
-            todos=list(state.get("todos") or []),
-            summary=state.get("summary"),
-            snapshots=dict(state.get("snapshots") or {}),
             data_dir=data_dir,
         )
 

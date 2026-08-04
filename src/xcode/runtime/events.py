@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from typing import Any, Final
-from uuid import uuid4
 
 TEXT_DELTA: Final = "text_delta"
 THINKING_DELTA: Final = "thinking_delta"
@@ -34,8 +33,3 @@ def map_finish_reason(reason: str | None) -> str:
     if reason in {None, "", "stop"}:
         return "end_turn"
     return str(reason)
-
-
-def new_run_id() -> str:
-    """生成 trace 用的 run id（不进入产品事件）。"""
-    return f"run-{uuid4().hex[:12]}"

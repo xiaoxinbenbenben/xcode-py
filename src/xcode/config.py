@@ -18,13 +18,10 @@ class Config:
     model: str
     light_model: str
     data_home: Path
-    max_tool_output_chars: int = 12_000
-    auto_compact_turns: int = 40
-    trace_enabled: bool = False
 
 
 def default_data_home() -> Path:
-    """返回用户级数据根目录（会话 / 记忆落盘处）。"""
+    """返回用户级数据根目录（会话落盘处）。"""
     return Path.home() / ".xcode"
 
 
@@ -56,7 +53,4 @@ def load_config(
         model=os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip(),
         light_model=os.getenv("OPENAI_LIGHT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip(),
         data_home=data_home,
-        max_tool_output_chars=int(os.getenv("XCODE_MAX_TOOL_OUTPUT", "12000")),
-        auto_compact_turns=int(os.getenv("XCODE_AUTO_COMPACT_TURNS", "40")),
-        trace_enabled=os.getenv("TRACE_ENABLED", "false").lower() in {"1", "true", "yes"},
     )

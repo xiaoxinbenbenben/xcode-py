@@ -1,5 +1,7 @@
 .DS_Store
 .env
+XCODE.local.md
+.idea/
 .venv/
 __pycache__/
 *.py[cod]

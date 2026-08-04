@@ -11,7 +11,6 @@ from typing import Annotated, Optional
 
 import typer
 from rich.console import Console
-from rich.prompt import Confirm
 
 from xcode import __version__
 from xcode.config import load_config
@@ -77,10 +76,6 @@ def main(
         runtime.meta.workspace_root = str(root)
         runtime.save()
 
-    def ask(tool_name: str, params: dict) -> bool:
-        console.print(f"[yellow]Permission[/] {tool_name}: {params}")
-        return Confirm.ask("Allow?", default=True)
-
     if prompt is not None:
         code = asyncio.run(
             run_once(
@@ -93,7 +88,7 @@ def main(
         )
         raise typer.Exit(code)
 
-    asyncio.run(start_tui(config=config, session=runtime, store=store, ask_permission=ask))
+    asyncio.run(start_tui(config=config, session=runtime, store=store))
 
 
 @app.command("doctor")
