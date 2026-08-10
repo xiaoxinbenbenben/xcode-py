@@ -69,7 +69,11 @@ def main(
 
     root = (workspace or Path.cwd()).resolve()
     config = load_config(project_root=root)
-    store = SessionStore(config.data_home)
+    store = SessionStore(
+        config.data_home,
+        tool_prune_chars=config.tool_prune_chars,
+        transcript_hard_cap=config.transcript_hard_cap,
+    )
     # --workspace 仅在新建时强制绑定；恢复时以会话内记录为准
     runtime = store.resolve(root, session_id=session_id, new_session=new_session)
     if workspace is not None and new_session:
@@ -111,6 +115,14 @@ def doctor(
     console.print_json(json.dumps(checks, ensure_ascii=False))
 
 
+def _store_from_config(config) -> SessionStore:
+    return SessionStore(
+        config.data_home,
+        tool_prune_chars=config.tool_prune_chars,
+        transcript_hard_cap=config.transcript_hard_cap,
+    )
+
+
 @session_app.command("list")
 def session_list(
     workspace: Annotated[Optional[Path], typer.Option("--workspace")] = None,
@@ -118,7 +130,7 @@ def session_list(
     """列出当前 workspace 下的会话。"""
     root = (workspace or Path.cwd()).resolve()
     config = load_config(project_root=root)
-    store = SessionStore(config.data_home)
+    store = _store_from_config(config)
     items = store.list_sessions(root)
     if not items:
         console.print("(no sessions)")
@@ -136,6 +148,6 @@ def session_new(
     """新建会话并打印 id。"""
     root = (workspace or Path.cwd()).resolve()
     config = load_config(project_root=root)
-    store = SessionStore(config.data_home)
+    store = _store_from_config(config)
     runtime = store.create(root)
     console.print(runtime.session_id)

@@ -1,8 +1,8 @@
 """内置工具表（todo #7 按目标清单回填）。
 
 所有 execute 均为 async（供子进程 / HTTP 类工具复用）。
-已实现：read_file / write_file / edit_file / list_dir / glob / grep / bash / web_search / web_fetch
-待回填：save_memory / load_skill / search_code / revert_turn
+已实现：read_file / write_file / edit_file / list_dir / glob / grep / bash / web_search / web_fetch / memory_read / memory_grep
+待回填：load_skill / search_code / revert_turn
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from xcode.memory import MemoryStore
 from xcode.tools.base import Tool, ToolContext, ToolResult, resolve_workspace_path
 from xcode.web import fetch_url, search_web
 
@@ -594,6 +595,81 @@ class WebFetchTool(Tool):
         return ToolResult(text)
 
 
+class MemoryReadTool(Tool):
+    """按需读取长期记忆目录下的文件（相对 memories 根）。
+
+    system 已含 memory_summary；本工具用于 MEMORY.md 或具体 rollout。
+    路径经 MemoryStore.resolve_rel 防穿越。
+    """
+
+    name = "memory_read"
+    description = (
+        "Read a file under the project long-term memory directory "
+        "(MEMORY.md, rollout_summaries/..., raw_memories.md). "
+        "Do NOT re-read memory_summary.md — it is already in the system prompt. "
+        "Path is relative to the memories root."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": 'Relative path e.g. "MEMORY.md" or "rollout_summaries/xxx.md"',
+            },
+        },
+        "required": ["path"],
+    }
+
+    async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        if ctx.data_home is None:
+            return ToolResult("memory_read error: data_home not configured", is_error=True)
+        path = args.get("path")
+        if not isinstance(path, str) or not path.strip():
+            return ToolResult("memory_read error: path is required", is_error=True)
+        # summary 已在 system，再读是浪费 token
+        if path.strip().replace("\\", "/").endswith("memory_summary.md"):
+            return ToolResult(
+                "memory_summary.md is already in the system prompt; do not re-read it. "
+                "Use MEMORY.md or rollout_summaries instead."
+            )
+        store = MemoryStore(ctx.data_home, ctx.workspace)
+        try:
+            text = store.read_rel(path.strip())
+        except PermissionError as exc:
+            return ToolResult(f"memory_read error: {exc}", is_error=True)
+        except FileNotFoundError:
+            return ToolResult(f"memory_read error: not found: {path}", is_error=True)
+        except OSError as exc:
+            return ToolResult(f"memory_read error: {exc}", is_error=True)
+        return ToolResult(text)
+
+
+class MemoryGrepTool(Tool):
+    """在 MEMORY.md + 近期 rollout 里做关键词 AND 子串搜索，比先整文件 read 更省。"""
+
+    name = "memory_grep"
+    description = (
+        "Search project long-term memory (MEMORY.md and recent rollouts) by keywords. "
+        "Prefer this before opening large MEMORY.md sections."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Space-separated keywords (AND)"},
+        },
+        "required": ["query"],
+    }
+
+    async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        if ctx.data_home is None:
+            return ToolResult("memory_grep error: data_home not configured", is_error=True)
+        query = args.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return ToolResult("memory_grep error: query is required", is_error=True)
+        store = MemoryStore(ctx.data_home, ctx.workspace)
+        return ToolResult(store.grep(query.strip()))
+
+
 def builtin_tools() -> list[Tool]:
     """返回当前已实现的内置工具。"""
     return [
@@ -606,4 +682,6 @@ def builtin_tools() -> list[Tool]:
         BashTool(),
         WebSearchTool(),
         WebFetchTool(),
+        MemoryReadTool(),
+        MemoryGrepTool(),
     ]

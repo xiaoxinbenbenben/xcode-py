@@ -1,4 +1,39 @@
-"""会话持久化：新建 / 恢复 / 列表，以及 workspace 绑定。"""
+"""会话 / 历史：transcript 权威流水 + context 送模缓存。
+
+## 要解决什么
+1. **可恢复**：进程退出或崩溃后，还能用同一 session_id 续聊。
+2. **长会话不炸**：工具输出截断（prune）+ 上下文压缩（compact），控制送进模型的窗口。
+
+## 磁盘布局（每个 session 一个目录）
+  {data_home}/projects/{project_key}/sessions/{session_id}/
+    meta.json            # 名片：id、标题、workspace、时间
+    transcript.jsonl     # 权威：只追加事件（message / compact）
+    context.json         # 缓存：当前送模 messages + 书签（byte_offset 等）
+  同级 current_session.json  # 项目「上次打开的是哪个 session」
+
+## 两条数据路径（必须分清）
+- **transcript**：发生过的事（审计/重建）。尽量保留全文；触硬顶会标记 truncated。
+- **messages / context**：下一轮 API 真正吃的窗口。tool 内容会 prune；compact 后变成
+  [摘要消息] + 近端若干 user turn group。
+
+## 写入时序（正常一轮对话）
+1. agent 每产生一条 user/assistant/tool → 只走 ``append_message``：
+   - 分配单调 event_id
+   - 追加一行 JSONL 并 flush
+   - 把 **prune 后** 的消息放进内存 messages
+2. 即将调用模型前（agent 里）：若 token 超阈 → ``apply_compact`` 再请求
+3. 整轮结束：``write_context`` 原子写 context.json + meta（书签 = 当前文件字节偏移）
+
+## Resume（load）
+1. 有 context 且文件大小 == byte_offset、id/count 对得上 → 直接用缓存 messages
+2. 文件比 offset 更长 → 只解析尾巴，增量合并
+3. 否则 / context 坏了 → 从「最后一个 compact 事件」重建（不必重放 compact 前全文）
+4. JSONL 最后一行不是完整 JSON → 当作写崩半行，丢弃
+
+## 与长期记忆的边界
+本模块只管「这一场聊」；跨会话事实在 ``xcode.memory``，互不替代。
+详见 docs/session-history.md。
+"""
 
 from __future__ import annotations
 
@@ -11,8 +46,18 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from xcode.runtime.tokens import count_messages_tokens
+
 _WHITESPACE_RE = re.compile(r"\s+")
 _FILE_MENTION_RE = re.compile(r"@\S+")
+
+TRANSCRIPT_NAME = "transcript.jsonl"
+CONTEXT_NAME = "context.json"
+META_NAME = "meta.json"
+
+DEFAULT_TOOL_PRUNE_CHARS = 16_000
+DEFAULT_TRANSCRIPT_HARD_CAP = 2_000_000
+DEFAULT_RETAINED_USER_GROUPS = 6
 
 
 def _utc_now() -> str:
@@ -20,10 +65,131 @@ def _utc_now() -> str:
 
 
 def project_key(workspace: Path) -> str:
-    """把 workspace 绝对路径映射为稳定短 key，用作数据子目录名。"""
+    """把 workspace 绝对路径映射为稳定短 key，用作数据子目录名。
+
+    这里的 sha1 仅用于「路径 → 短目录名」，避免绝对路径里的斜杠/中文把目录打爆；
+    与 tool 截断、内容校验无关。
+    """
     digest = sha1(str(workspace.resolve()).encode("utf-8")).hexdigest()[:12]
     name = re.sub(r"[^a-zA-Z0-9_-]+", "-", workspace.name).strip("-") or "project"
     return f"{name}-{digest}"
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """临时文件 + rename 写 JSON，避免写到一半进程挂掉留下半截文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def prune_tool_content(content: str, *, limit: int = DEFAULT_TOOL_PRUNE_CHARS) -> str:
+    """送模侧截断 tool 输出。
+
+    只砍 content 字符串，不删消息本身，避免破坏 assistant.tool_calls ↔ tool.tool_call_id 配对。
+    壳里只写 original_chars / kept_chars，方便人和模型看出「被截过」；不做内容哈希。
+    """
+    if not isinstance(content, str):
+        content = str(content)
+    if len(content) <= limit:
+        return content
+    kept = content[:limit]
+    return (
+        f'<tool_output_truncated original_chars="{len(content)}" '
+        f'kept_chars="{limit}">\n'
+        f"{kept}\n"
+        f"</tool_output_truncated>"
+    )
+
+
+def _maybe_hard_cap(content: str, *, hard_cap: int) -> tuple[str, bool, int, int]:
+    """JSONL 单事件硬顶：超过则截断并标记 truncated（仍禁止静默）。
+
+    返回 (content, truncated, original_chars, kept_chars)。
+    """
+    if not isinstance(content, str):
+        content = str(content)
+    original = len(content)
+    if original <= hard_cap:
+        return content, False, original, original
+    return content[:hard_cap], True, original, hard_cap
+
+def openai_message_for_memory(msg: dict[str, Any]) -> dict[str, Any]:
+    """拷贝为可送模的 message（浅拷贝字段）。"""
+    out: dict[str, Any] = {"role": msg["role"]}
+    if "content" in msg:
+        out["content"] = msg["content"]
+    if msg.get("tool_calls") is not None:
+        out["tool_calls"] = msg["tool_calls"]
+    if msg.get("tool_call_id") is not None:
+        out["tool_call_id"] = msg["tool_call_id"]
+    if msg.get("name") is not None:
+        out["name"] = msg["name"]
+    return out
+
+
+def prune_message_for_model(
+    msg: dict[str, Any],
+    *,
+    tool_prune_chars: int = DEFAULT_TOOL_PRUNE_CHARS,
+) -> dict[str, Any]:
+    """生成送模用消息：tool content 截断，其它原样。"""
+    out = openai_message_for_memory(msg)
+    if out.get("role") == "tool" and isinstance(out.get("content"), str):
+        out["content"] = prune_tool_content(out["content"], limit=tool_prune_chars)
+    return out
+
+
+def split_user_turn_groups(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """按「用户回合组」切分，不是按消息条数。
+
+    一组 = 一条 user + 后面连续的 assistant/tool（可能多轮 tool 循环）+ 最终 assistant。
+    compact 保留「最近 N 组」时必须用这个切法，否则会把 tool 配对切碎。
+    """
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") == "user":
+            if current:
+                groups.append(current)
+            current = [msg]
+        else:
+            if not current:
+                # 前缀（如 compact summary 也可能是 user）——无 user 时自成一组
+                current = [msg]
+            else:
+                current.append(msg)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def retain_last_user_groups(
+    messages: list[dict[str, Any]],
+    *,
+    n: int = DEFAULT_RETAINED_USER_GROUPS,
+) -> list[dict[str, Any]]:
+    """保留最近 n 个 user turn group。"""
+    if n <= 0:
+        return []
+    groups = split_user_turn_groups(messages)
+    if not groups:
+        return []
+    kept = groups[-n:]
+    out: list[dict[str, Any]] = []
+    for g in kept:
+        out.extend(g)
+    return out
+
+
+def summary_message(summary: str) -> dict[str, Any]:
+    """Compact 摘要作为一条 user 消息注入窗口。"""
+    text = summary.strip()
+    return {
+        "role": "user",
+        "content": f"<compact_summary>\n{text}\n</compact_summary>",
+    }
 
 
 @dataclass(slots=True)
@@ -59,11 +225,24 @@ class SessionMeta:
 
 @dataclass
 class SessionRuntime:
-    """单个会话的内存视图：元数据 + 对话消息。"""
+    """单个会话的运行时状态。
+
+    字段分工：
+    - messages：当前送模窗口（已 prune / 可能已 compact）
+    - last_event_id / event_count / byte_offset：与 transcript 对齐的书签
+    - estimated_tokens：本地估算，给 TUI 和调试用（非账单精确值）
+    """
 
     meta: SessionMeta
     messages: list[dict[str, Any]] = field(default_factory=list)
     data_dir: Path = field(default_factory=Path)
+    last_event_id: int = 0
+    event_count: int = 0
+    byte_offset: int = 0
+    estimated_tokens: int = 0
+    tool_prune_chars: int = DEFAULT_TOOL_PRUNE_CHARS
+    transcript_hard_cap: int = DEFAULT_TRANSCRIPT_HARD_CAP
+    retained_user_groups: int = DEFAULT_RETAINED_USER_GROUPS
 
     @property
     def session_id(self) -> str:
@@ -72,6 +251,14 @@ class SessionRuntime:
     @property
     def workspace_root(self) -> Path:
         return Path(self.meta.workspace_root)
+
+    @property
+    def transcript_path(self) -> Path:
+        return self.data_dir / TRANSCRIPT_NAME
+
+    @property
+    def context_path(self) -> Path:
+        return self.data_dir / CONTEXT_NAME
 
     def touch(self) -> None:
         self.meta.last_active_at = _utc_now()
@@ -88,30 +275,418 @@ class SessionRuntime:
             self.meta.name = text
             self.meta.default_name = False
 
-    def save(self) -> None:
-        """把会话写入 data_dir（副作用：写磁盘）。"""
+    def _write_meta_and_pointer(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        (self.data_dir / "meta.json").write_text(
-            json.dumps(self.meta.as_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        payload = {"messages": self.messages}
-        (self.data_dir / "state.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        _atomic_write_json(self.data_dir / META_NAME, self.meta.as_dict())
         pointer = self.data_dir.parent / "current_session.json"
-        pointer.write_text(
-            json.dumps({"session_id": self.session_id}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        _atomic_write_json(pointer, {"session_id": self.session_id})
+
+    def write_context(self, *, model: str = "", fsync_transcript: bool = False) -> None:
+        """把「当前送模窗口 + 书签」落到 context.json。
+
+        过程：
+        1. 用 tiktoken 估 messages 的 token，写入 estimated_tokens
+        2. 带上 event_count / last_event_id / byte_offset，供下次 load 对账
+        3. 临时文件 + rename（原子替换）
+        4. 同步写 meta 与 current_session 指针
+        5. 可选 fsync transcript，降低整轮结束时丢尾部风险
+        """
+        self.estimated_tokens = count_messages_tokens(self.messages, model=model)
+        payload = {
+            "schema_version": 1,
+            "session_id": self.session_id,
+            "transcript_event_count": self.event_count,
+            "transcript_last_event_id": self.last_event_id,
+            "transcript_byte_offset": self.byte_offset,
+            "messages": self.messages,
+            "estimated_tokens": self.estimated_tokens,
+        }
+        _atomic_write_json(self.context_path, payload)
+        self._write_meta_and_pointer()
+        if fsync_transcript and self.transcript_path.is_file():
+            with self.transcript_path.open("rb") as fh:
+                fh.flush()
+                try:
+                    import os
+
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+
+    def save(self) -> None:
+        """兼容旧调用：写 context + meta（不重复写 transcript）。"""
+        self.touch()
+        self.write_context(fsync_transcript=True)
+
+    def append_message(self, message: dict[str, Any]) -> dict[str, Any]:
+        """会话消息的唯一写入入口（agent 禁止直接 messages.append）。
+
+        过程逐步：
+        1. 规范化 role / content
+        2. 若内容过大 → JSONL 侧硬顶截断，并标 truncated=true（禁止静默）
+        3. event_id += 1，拼 type=message 事件，append 到 transcript.jsonl 并 flush
+        4. 更新 byte_offset = 文件当前大小（给 context 书签用）
+        5. 生成送模版：tool content 再 prune 到 tool_prune_chars，append 到 self.messages
+        6. 返回送模版消息
+
+        注意：JSONL 里尽量是「更完整」的 content；内存 messages 是「更短」的送模视图。
+        """
+        role = str(message.get("role") or "")
+        if role not in {"user", "assistant", "tool", "system"}:
+            raise ValueError(f"unsupported role: {role}")
+
+        content = message.get("content")
+        content_str: str | None
+        if content is None:
+            content_str = None
+        elif isinstance(content, str):
+            content_str = content
+        else:
+            content_str = json.dumps(content, ensure_ascii=False)
+
+        truncated = False
+        original_chars: int | None = None
+        kept_chars: int | None = None
+        disk_content = content_str
+        # 大 tool / 异常大文本：JSONL 也有硬顶（有上限的产品记录，不是原始冷归档）
+        if isinstance(content_str, str) and (
+            role == "tool" or len(content_str) > self.transcript_hard_cap
+        ):
+            disk_content, truncated, original_chars, kept_chars = _maybe_hard_cap(
+                content_str, hard_cap=self.transcript_hard_cap
+            )
+
+        self.last_event_id += 1
+        self.event_count += 1
+        event: dict[str, Any] = {
+            "v": 1,
+            "event_id": self.last_event_id,
+            "type": "message",
+            "created_at": _utc_now(),
+            "role": role,
+            "content": disk_content,
+            "tool_calls": message.get("tool_calls"),
+            "tool_call_id": message.get("tool_call_id"),
+            "truncated": truncated,
+            "original_chars": original_chars if truncated else None,
+            "kept_chars": kept_chars if truncated else None,
+        }
+        if message.get("name") is not None:
+            event["name"] = message["name"]
+
+        line = json.dumps(event, ensure_ascii=False) + "\n"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        with self.transcript_path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+        self.byte_offset = self.transcript_path.stat().st_size
+
+        model_msg = prune_message_for_model(
+            {
+                "role": role,
+                "content": disk_content if role == "tool" else content_str,
+                "tool_calls": message.get("tool_calls"),
+                "tool_call_id": message.get("tool_call_id"),
+                **({"name": message["name"]} if message.get("name") is not None else {}),
+            },
+            tool_prune_chars=self.tool_prune_chars,
         )
+        # assistant content None 保持
+        if role == "assistant" and content is None:
+            model_msg["content"] = None
+        self.messages.append(model_msg)
+        return model_msg
+
+    def apply_compact(self, summary: str, *, model: str = "") -> None:
+        """执行一次上下文压缩（摘要文本由调用方用 light_model 生成）。
+
+        过程：
+        1. 从当前 messages 取出最近 retained_user_groups 个 user turn group（已 prune）
+        2. 写一条 type=compact 事件到 JSONL，内含：
+           - summary：handoff 摘要
+           - retained_messages：当时的近端窗口（自包含，重建不必重放更早历史）
+           - source_through_event_id：压缩覆盖到的最后一个旧 event_id
+        3. 内存 messages 替换为 [summary_message] + retained_messages
+
+        transcript 里 compact 之前的 message 行仍保留（审计用），只是送模不再带上。
+        """
+        retained = retain_last_user_groups(
+            self.messages, n=self.retained_user_groups
+        )
+        # 确保 retained 内 tool 已 prune
+        retained = [
+            prune_message_for_model(m, tool_prune_chars=self.tool_prune_chars) for m in retained
+        ]
+        source_through = self.last_event_id
+        self.last_event_id += 1
+        self.event_count += 1
+        event = {
+            "v": 1,
+            "event_id": self.last_event_id,
+            "type": "compact",
+            "created_at": _utc_now(),
+            "source_through_event_id": source_through,
+            "summary": summary.strip(),
+            "retained_messages": retained,
+            "estimated_tokens": 0,
+        }
+        new_messages = [summary_message(summary), *retained]
+        event["estimated_tokens"] = count_messages_tokens(new_messages, model=model)
+
+        line = json.dumps(event, ensure_ascii=False) + "\n"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        with self.transcript_path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+        self.byte_offset = self.transcript_path.stat().st_size
+        self.messages = new_messages
+        self.estimated_tokens = event["estimated_tokens"]
+
+    def estimate_message_tokens(self, *, model: str = "") -> int:
+        return count_messages_tokens(self.messages, model=model)
+
+    def needs_compact(
+        self,
+        *,
+        overhead_tokens: int,
+        context_window: int,
+        compact_threshold: float,
+        reserved_output_tokens: int,
+        model: str = "",
+    ) -> bool:
+        """判断「再请求模型是否会顶满窗口」。
+
+        预算 = 固定前缀(overhead：system/tools 等) + 当前 messages + 预留给模型输出的 reserve。
+        当 budget >= context_window * threshold 时返回 True。
+        真正调用 LLM 生成摘要在 agent.ensure_context_budget，不在本方法里。
+        """
+        if context_window <= 0:
+            return False
+        used = overhead_tokens + self.estimate_message_tokens(model=model)
+        limit = int(context_window * compact_threshold)
+        return (used + reserved_output_tokens) >= limit
+
+    # --- 加载 / 回放 ---
+
+    @staticmethod
+    def _read_transcript_events(path: Path) -> list[dict[str, Any]]:
+        """读 JSONL；丢弃最后一行不完整 JSON。"""
+        if not path.is_file():
+            return []
+        raw = path.read_bytes()
+        if not raw:
+            return []
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        events: list[dict[str, Any]] = []
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                if i == len(lines) - 1:
+                    break  # 半行
+                continue
+            if isinstance(obj, dict):
+                events.append(obj)
+        return events
+
+    @staticmethod
+    def _events_from_offset(path: Path, offset: int) -> list[dict[str, Any]]:
+        if not path.is_file() or offset < 0:
+            return []
+        size = path.stat().st_size
+        if offset >= size:
+            return []
+        with path.open("rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read().decode("utf-8", errors="replace")
+        events: list[dict[str, Any]] = []
+        lines = chunk.splitlines()
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                if i == len(lines) - 1:
+                    break
+                continue
+            if isinstance(obj, dict):
+                events.append(obj)
+        return events
+
+    def _message_from_event(
+        self, event: dict[str, Any], *, for_model: bool
+    ) -> dict[str, Any] | None:
+        if event.get("type") != "message":
+            return None
+        msg: dict[str, Any] = {
+            "role": event.get("role"),
+            "content": event.get("content"),
+        }
+        if event.get("tool_calls") is not None:
+            msg["tool_calls"] = event["tool_calls"]
+        if event.get("tool_call_id") is not None:
+            msg["tool_call_id"] = event["tool_call_id"]
+        if event.get("name") is not None:
+            msg["name"] = event["name"]
+        if for_model:
+            return prune_message_for_model(msg, tool_prune_chars=self.tool_prune_chars)
+        return msg
+
+    def _rebuild_from_events(self, events: list[dict[str, Any]]) -> None:
+        """从事件列表重建 messages 与计数器。"""
+        last_compact_idx = -1
+        for i, ev in enumerate(events):
+            if ev.get("type") == "compact":
+                last_compact_idx = i
+
+        if last_compact_idx >= 0:
+            compact = events[last_compact_idx]
+            summary = str(compact.get("summary") or "")
+            retained = list(compact.get("retained_messages") or [])
+            retained = [
+                prune_message_for_model(m, tool_prune_chars=self.tool_prune_chars)
+                for m in retained
+                if isinstance(m, dict)
+            ]
+            source_through = int(compact.get("source_through_event_id") or 0)
+            messages = [summary_message(summary), *retained]
+            for ev in events[last_compact_idx + 1 :]:
+                if ev.get("type") != "message":
+                    continue
+                eid = int(ev.get("event_id") or 0)
+                if eid <= source_through:
+                    continue
+                msg = self._message_from_event(ev, for_model=True)
+                if msg is not None:
+                    messages.append(msg)
+            self.messages = messages
+        else:
+            messages = []
+            for ev in events:
+                msg = self._message_from_event(ev, for_model=True)
+                if msg is not None:
+                    messages.append(msg)
+            self.messages = messages
+
+        if events:
+            self.last_event_id = max(int(e.get("event_id") or 0) for e in events)
+            self.event_count = len(events)
+        else:
+            self.last_event_id = 0
+            self.event_count = 0
+        if self.transcript_path.is_file():
+            self.byte_offset = self.transcript_path.stat().st_size
+        else:
+            self.byte_offset = 0
+
+    def _apply_message_events(self, events: list[dict[str, Any]]) -> None:
+        """增量应用 message / compact 事件到当前窗口。"""
+        for ev in events:
+            et = ev.get("type")
+            if et == "compact":
+                summary = str(ev.get("summary") or "")
+                retained = list(ev.get("retained_messages") or [])
+                retained = [
+                    prune_message_for_model(m, tool_prune_chars=self.tool_prune_chars)
+                    for m in retained
+                    if isinstance(m, dict)
+                ]
+                self.messages = [summary_message(summary), *retained]
+            elif et == "message":
+                msg = self._message_from_event(ev, for_model=True)
+                if msg is not None:
+                    self.messages.append(msg)
+            eid = int(ev.get("event_id") or 0)
+            if eid > self.last_event_id:
+                self.last_event_id = eid
+            self.event_count += 1
+        if self.transcript_path.is_file():
+            self.byte_offset = self.transcript_path.stat().st_size
+
+    def load_state_from_disk(self) -> None:
+        """打开已有 session 时恢复 messages（SessionStore.load 调用）。
+
+        决策树：
+        A. context 存在且 session_id 匹配
+           A1. 文件 size == byte_offset 且末 event_id/count 一致 → 信任 context.messages
+           A2. 文件更长 → 以 context 为底，只回放 offset 之后的新事件
+           A3. 对不上 → 走 B
+        B. 从 transcript 全量事件重建：优先最后一个 compact 检查点 + 其后 message
+        半行 JSON 在读事件时已丢弃，不会污染 messages。
+        """
+        path = self.transcript_path
+        events_all = self._read_transcript_events(path)
+        # 半行丢弃后，真实权威长度以「完整事件重写后的逻辑」对齐：用当前完整文件 size
+        file_size = path.stat().st_size if path.is_file() else 0
+
+        ctx: dict[str, Any] | None = None
+        if self.context_path.is_file():
+            try:
+                ctx = json.loads(self.context_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                ctx = None
+
+        if ctx and str(ctx.get("session_id") or "") == self.session_id:
+            offset = int(ctx.get("transcript_byte_offset") or 0)
+            last_id = int(ctx.get("transcript_last_event_id") or 0)
+            count = int(ctx.get("transcript_event_count") or 0)
+            cached_messages = list(ctx.get("messages") or [])
+
+            if file_size == offset and last_id == (
+                max((int(e.get("event_id") or 0) for e in events_all), default=0)
+            ) and count == len(events_all):
+                self.messages = cached_messages
+                self.last_event_id = last_id
+                self.event_count = count
+                self.byte_offset = offset
+                self.estimated_tokens = int(ctx.get("estimated_tokens") or 0)
+                return
+
+            if file_size > offset >= 0 and count == len(
+                [e for e in events_all if int(e.get("event_id") or 0) <= last_id]
+            ):
+                # 尾部增量：信任 context messages 作为到 last_id 的状态
+                self.messages = cached_messages
+                self.last_event_id = last_id
+                self.event_count = count
+                self.byte_offset = offset
+                tail = self._events_from_offset(path, offset)
+                # 仅接受 event_id > last_id
+                tail = [e for e in tail if int(e.get("event_id") or 0) > last_id]
+                if tail:
+                    self._apply_message_events(tail)
+                self.estimated_tokens = count_messages_tokens(self.messages)
+                return
+
+        # 完整从 compact 重建
+        self._rebuild_from_events(events_all)
+        self.estimated_tokens = count_messages_tokens(self.messages)
 
 
 class SessionStore:
-    """按 workspace 管理会话目录。"""
+    """按 workspace 管理会话目录：create / load / list / resolve。
 
-    def __init__(self, data_home: Path) -> None:
+    resolve 优先级（与 CLI 一致）：
+      --new-session → 指定 --session id → current_session.json → 最近活跃 → 新建
+    不负责迁移旧 state.json；新格式只认 meta + transcript + context。
+    """
+
+    def __init__(
+        self,
+        data_home: Path,
+        *,
+        tool_prune_chars: int = DEFAULT_TOOL_PRUNE_CHARS,
+        transcript_hard_cap: int = DEFAULT_TRANSCRIPT_HARD_CAP,
+    ) -> None:
         self.data_home = data_home
+        self.tool_prune_chars = tool_prune_chars
+        self.transcript_hard_cap = transcript_hard_cap
 
     def _project_dir(self, workspace: Path) -> Path:
         return self.data_home / "projects" / project_key(workspace)
@@ -120,6 +695,12 @@ class SessionStore:
         path = self._project_dir(workspace) / "sessions"
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def _runtime_kwargs(self) -> dict[str, Any]:
+        return {
+            "tool_prune_chars": self.tool_prune_chars,
+            "transcript_hard_cap": self.transcript_hard_cap,
+        }
 
     def create(
         self,
@@ -142,32 +723,37 @@ class SessionStore:
         runtime = SessionRuntime(
             meta=meta,
             data_dir=self.sessions_dir(workspace) / session_id,
+            **self._runtime_kwargs(),
         )
-        runtime.save()
+        runtime.data_dir.mkdir(parents=True, exist_ok=True)
+        if not runtime.transcript_path.exists():
+            runtime.transcript_path.write_text("", encoding="utf-8")
+        runtime.write_context(fsync_transcript=False)
         return runtime
 
     def load(self, workspace: Path, session_id: str) -> SessionRuntime:
         """按 id 加载会话；不存在则抛 FileNotFoundError。"""
         data_dir = self.sessions_dir(workspace) / session_id
-        meta = SessionMeta.from_dict(
-            json.loads((data_dir / "meta.json").read_text(encoding="utf-8"))
-        )
-        state: dict[str, Any] = {}
-        state_path = data_dir / "state.json"
-        if state_path.is_file():
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-        return SessionRuntime(
+        meta_path = data_dir / META_NAME
+        if not meta_path.is_file():
+            raise FileNotFoundError(f"session not found: {session_id}")
+        meta = SessionMeta.from_dict(json.loads(meta_path.read_text(encoding="utf-8")))
+        runtime = SessionRuntime(
             meta=meta,
-            messages=list(state.get("messages") or []),
             data_dir=data_dir,
+            **self._runtime_kwargs(),
         )
+        runtime.load_state_from_disk()
+        return runtime
 
     def list_sessions(self, workspace: Path) -> list[SessionMeta]:
         """列出某 workspace 下已保存会话，按最近活跃倒序。"""
         root = self.sessions_dir(workspace)
         items: list[SessionMeta] = []
         for child in root.iterdir():
-            meta_path = child / "meta.json"
+            if not child.is_dir():
+                continue
+            meta_path = child / META_NAME
             if not meta_path.is_file():
                 continue
             items.append(SessionMeta.from_dict(json.loads(meta_path.read_text(encoding="utf-8"))))
@@ -186,12 +772,10 @@ class SessionStore:
         优先级：强制新建 → 指定 id → current 指针 → 最近会话 → 新建。
         """
         workspace = workspace.resolve()
-        # --- 1) 显式参数 ---
         if new_session:
             return self.create(workspace)
         if session_id:
             return self.load(workspace, session_id)
-        # --- 2) 项目下 current_session 指针 ---
         pointer = self.sessions_dir(workspace) / "current_session.json"
         if pointer.is_file():
             data = json.loads(pointer.read_text(encoding="utf-8"))
@@ -201,7 +785,6 @@ class SessionStore:
                     return self.load(workspace, sid)
                 except FileNotFoundError:
                     pass
-        # --- 3) 回落：最近一条或新建 ---
         existing = self.list_sessions(workspace)
         if existing:
             return self.load(workspace, existing[0].session_id)
