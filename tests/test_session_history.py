@@ -41,6 +41,43 @@ def test_user_turn_groups():
     assert retained[0]["content"] == "e"
 
 
+def test_tui_open_creates_empty_session_not_last(tmp_path: Path):
+    from xcode.entrypoints.cli import pick_runtime
+
+    store = SessionStore(tmp_path / "home")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    old = store.create(ws, name="旧对话")
+    old.append_message({"role": "user", "content": "历史"})
+    old.write_context()
+    fresh = pick_runtime(store, ws, prompt=None, session_id=None, new_session=False)
+    assert fresh.session_id != old.session_id
+    assert fresh.messages == []
+    continued = pick_runtime(
+        store, ws, prompt="接着做", session_id=old.session_id, new_session=False
+    )
+    assert continued.session_id == old.session_id
+
+
+def test_find_session_id_index_prefix_suffix(tmp_path: Path):
+    store = SessionStore(tmp_path / "home")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    a = store.create(ws, name="first")
+    b = store.create(ws, name="second")
+    # list is by last_active desc → b then a after create order (b newer)
+    assert store.find_session_id(ws, "1") == b.session_id
+    assert store.find_session_id(ws, "2") == a.session_id
+    assert store.find_session_id(ws, a.session_id) == a.session_id
+    assert store.find_session_id(ws, a.session_id[:10]) == a.session_id
+    assert store.find_session_id(ws, a.session_id[-8:]) == a.session_id
+    try:
+        store.find_session_id(ws, "sess-nope")
+        raise AssertionError("expected ValueError")
+    except ValueError as exc:
+        assert "not found" in str(exc)
+
+
 def test_append_and_resume_roundtrip(tmp_path: Path):
     store = SessionStore(tmp_path / "home", tool_prune_chars=50)
     ws = tmp_path / "ws"

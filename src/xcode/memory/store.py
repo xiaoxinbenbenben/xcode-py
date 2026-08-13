@@ -117,6 +117,20 @@ class MemoryStore:
             return text
         return text[:limit]
 
+    def summary_is_placeholder(self) -> bool:
+        """summary 是否仍是空模板（stage2 尚未合并出有效摘要）。"""
+        text = self.read_summary(limit=None)
+        return not text.strip() or text.strip() == _EMPTY_SUMMARY.strip()
+
+    def memory_has_entries(self) -> bool:
+        """MEMORY.md 是否已有超过空模板的内容。"""
+        try:
+            text = self.read_rel(MEMORY_NAME, limit=None)
+        except (FileNotFoundError, OSError, PermissionError):
+            return False
+        body = text.strip()
+        return bool(body) and body != _EMPTY_MEMORY.strip()
+
     def append_raw(self, body: str) -> None:
         self.ensure_layout()
         path = self.root / RAW_NAME

@@ -17,13 +17,13 @@ class ToolContext:
     ask_permission：高危工具执行前的审批回调，**仅当工具声明
     requires_approval=True 时才会被运行时调用**；普通工具不询问。
     回调为 None（如 -p 非交互模式未注入）时不询问、一律拒绝。
-    注意：当前内置工具均未声明 requires_approval（首个使用者是
-    任务 3 的 revert_turn；bash 等 -p 模式仍需可用的工具暂不设）。
+    snapshot：本会话文件快照；write/edit 改盘前登记，revert_turn 从此读。
     """
 
     workspace: Path
     data_home: Path | None = None
     ask_permission: Callable[[str], Awaitable[bool]] | None = None
+    snapshot: Any = None
 
 
 @dataclass(slots=True)

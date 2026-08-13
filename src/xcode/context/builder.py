@@ -1,8 +1,8 @@
 """组装每轮发给模型的 system / user 文本（不负责会话落盘）。
 
 ## 本轮上下文从哪来
-- system：身份准则 + 工作区 XCODE.md/XCODE.local.md + **长期记忆 summary 段**
-- user_text：用户原文（@ 文件等由上游处理；此处原样）
+- system：身份准则 + 工作区 XCODE.md/XCODE.local.md + **长期记忆 summary 段** + skills catalog
+- user_text：用户原文（不改写、不注入文件）
 - history：调用方传入的 session.messages 快照（实际送模仍以 session.messages 为准）
 
 长期记忆：只通过 summary_prompt_block 注入短 summary，细节靠 memory_* 工具。
@@ -18,6 +18,7 @@ from typing import Any
 
 from xcode.memory import MemoryStore, summary_prompt_block
 from xcode.runtime.session import SessionRuntime
+from xcode.skill import SkillRegistry
 
 _PROJECT_FILE_LIMIT = 4000
 _PROJECT_TOTAL_LIMIT = 8000
@@ -56,8 +57,9 @@ def assemble_system_prompt(
     tool_names: list[str],
     model: str | None = None,
     data_home: Path | None = None,
+    skills: SkillRegistry | None = None,
 ) -> str:
-    """组装发给模型的 system 主段（身份 / 现场 / 准则 / 项目说明 / 长期记忆摘要）。"""
+    """组装发给模型的 system 主段（身份 / 现场 / 准则 / 项目说明 / 长期记忆摘要 / skills）。"""
     parts = [
         "你是 xcode，一个在用户本地仓库工作的 coding agent。",
         f"当前时间：{datetime.now().isoformat(timespec='seconds')}",
@@ -80,6 +82,12 @@ def assemble_system_prompt(
             "长期记忆（memory_summary）仅为对话中沉淀的提示，冲突时以 XCODE/代码为准。",
             "- 长期记忆：system 仅含 memory_summary；细节用 memory_grep / memory_read 读 MEMORY.md 或 rollout；"
             "不要再打开 memory_summary。",
+            "- 长期记忆由后台管线从对话自动抽取并合并；不要用 bash/write 改 memories 目录下的文件。"
+            "用户要求「记住某事」时直接确认即可，下一轮后可 memory_read 核对。",
+            "- 创建或修改源码用 write_file / edit_file，不要用 bash（sed -i、echo >、perl -pi）。"
+            "bash 留给测试、git、构建。用户要求撤回上一轮文件改动时用 revert_turn。",
+            "- 任务明显匹配 Available skills 中某条时，先 load_skill 再按说明书做；不要一次预载全部。"
+            "说明书里的相对路径以 Base directory 为根，用 read_file 读文档、bash 跑脚本。",
         ]
     )
     project = _project_memory(workspace)
@@ -91,6 +99,10 @@ def assemble_system_prompt(
         memory = summary_prompt_block(store)
         if memory:
             parts.extend(["", memory])
+    registry = skills or SkillRegistry(workspace, data_home=data_home)
+    catalog = registry.catalog_text()
+    if catalog:
+        parts.extend(["", catalog])
     return "\n".join(parts)
 
 
@@ -101,13 +113,15 @@ def build_context_bundle(
     tool_names: list[str],
     model: str | None = None,
     data_home: Path | None = None,
+    skills: SkillRegistry | None = None,
 ) -> ContextBundle:
-    """组装本轮上下文：仅 system + 用户原文。"""
+    """组装本轮上下文：system + 用户原文。"""
     system = assemble_system_prompt(
         workspace=session.workspace_root,
         tool_names=tool_names,
         model=model,
         data_home=data_home,
+        skills=skills,
     )
     return ContextBundle(
         system=system,

@@ -88,3 +88,15 @@ def test_summary_prompt_block(tmp_path):
     assert "memory_summary.md" in block
     assert "pytest" in block
     assert "MEMORY.md" in block
+
+
+def test_summary_placeholder_and_memory_entries(tmp_path):
+    store = _store(tmp_path)
+    store.ensure_layout()
+    assert store.summary_is_placeholder()
+    assert not store.memory_has_entries()
+    store.atomic_write(MEMORY_NAME, "v1\n# MEMORY\n\n## 开发约定\n- 注释要写清楚\n")
+    assert store.memory_has_entries()
+    assert store.summary_is_placeholder()  # MEMORY 有内容但 summary 仍空
+    store.atomic_write(SUMMARY_NAME, "v1\n# Memory Summary\n有注释约定\n\n## What's in Memory\n- 约定\n")
+    assert not store.summary_is_placeholder()

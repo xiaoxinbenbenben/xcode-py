@@ -28,6 +28,20 @@ app.add_typer(session_app, name="session")
 console = Console()
 
 
+def pick_runtime(
+    store: SessionStore,
+    root: Path,
+    *,
+    prompt: str | None,
+    session_id: str | None,
+    new_session: bool,
+):
+    """TUI 无 --session 时新建空会话；-p / --session 走 resolve。"""
+    if prompt is None and session_id is None:
+        return store.create(root)
+    return store.resolve(root, session_id=session_id, new_session=new_session)
+
+
 def _version_callback(value: bool) -> None:
     if value:
         typer.echo(f"xcode {__version__}")
@@ -69,14 +83,31 @@ def main(
 
     root = (workspace or Path.cwd()).resolve()
     config = load_config(project_root=root)
+    if not config.api_key:
+        console.print(
+            "[red]OPENAI_API_KEY 未配置[/]\n"
+            "[dim]xcode 只认环境变量/`.env` 里的[/] [bold]OPENAI_API_KEY[/]"
+            "[dim]（不是业务项目的 API_KEY）。[/]\n"
+            "[dim]可任选：[/]\n"
+            "  1) 在 [bold]~/.xcode/.env[/] 写入 OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL\n"
+            "  2) 在当前目录 `.env` 写入同上\n"
+            "  3) shell: export OPENAI_API_KEY=...\n"
+            "[dim]自检：[/] uv run xcode doctor"
+        )
+        raise typer.Exit(2)
     store = SessionStore(
         config.data_home,
         tool_prune_chars=config.tool_prune_chars,
         transcript_hard_cap=config.transcript_hard_cap,
     )
-    # --workspace 仅在新建时强制绑定；恢复时以会话内记录为准
-    runtime = store.resolve(root, session_id=session_id, new_session=new_session)
-    if workspace is not None and new_session:
+    runtime = pick_runtime(
+        store,
+        root,
+        prompt=prompt,
+        session_id=session_id,
+        new_session=new_session,
+    )
+    if workspace is not None and (new_session or (prompt is None and session_id is None)):
         runtime.meta.workspace_root = str(root)
         runtime.save()
 
@@ -105,14 +136,21 @@ def doctor(
     checks = {
         "python": sys.version.split()[0],
         "uv": shutil.which("uv") or "missing",
-        "api_key": "configured" if config.api_key else "missing",
+        "api_key": "configured" if config.api_key else "MISSING — set OPENAI_API_KEY",
         "base_url": config.base_url,
         "model": config.model,
+        "light_model": config.light_model,
         "cwd": str(root),
         "data_home": str(config.data_home),
         "version": __version__,
+        "hint": (
+            "xcode reads OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL from env "
+            "or layered .env (cwd, ~/.xcode/.env). Business project API_KEY is ignored."
+        ),
     }
     console.print_json(json.dumps(checks, ensure_ascii=False))
+    if not config.api_key:
+        raise typer.Exit(2)
 
 
 def _store_from_config(config) -> SessionStore:
@@ -135,10 +173,12 @@ def session_list(
     if not items:
         console.print("(no sessions)")
         return
-    for meta in items:
-        console.print(
-            f"{meta.session_id}\t{meta.name}\t{meta.workspace_root}\t{meta.last_active_at}"
-        )
+    from xcode.entrypoints.session_picker import format_session_line, rows_from_metas
+
+    for i, row in enumerate(rows_from_metas(items), start=1):
+        console.print(format_session_line(row, index=i))
+        if row.preview:
+            console.print(f"     {row.preview}")
 
 
 @session_app.command("new")

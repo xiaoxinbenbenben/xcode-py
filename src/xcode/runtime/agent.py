@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -39,6 +40,7 @@ from xcode.runtime.events import (
     map_finish_reason,
 )
 from xcode.runtime.session import SessionRuntime, SessionStore
+from xcode.runtime.snapshot import SnapshotStore
 from xcode.runtime.tokens import count_messages_tokens, count_text_tokens
 from xcode.tools.base import ToolContext
 from xcode.tools.builtins import builtin_tools
@@ -247,15 +249,52 @@ async def run_compact(
     return summary
 
 
+def _is_cancelled(cancel_event: asyncio.Event | None) -> bool:
+    return cancel_event is not None and cancel_event.is_set()
+
+
+async def _iter_stream(stream: Any, cancel_event: asyncio.Event | None) -> AsyncIterator[Any]:
+    """读模型流；cancel_event 在等下一片时也能打断。"""
+
+    if cancel_event is None:
+        async for chunk in stream:
+            yield chunk
+        return
+    iterator = stream.__aiter__()
+    while not cancel_event.is_set():
+        next_task = asyncio.create_task(iterator.__anext__())
+        cancel_task = asyncio.create_task(cancel_event.wait())
+        done, pending = await asyncio.wait(
+            {next_task, cancel_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass
+        if cancel_event.is_set():
+            return
+        try:
+            yield next_task.result()
+        except StopAsyncIteration:
+            return
+
+
 async def _iter_tool_executions(
     *,
     ordered_calls: list[dict[str, Any]],
     registry: ToolRegistry,
     tool_ctx: ToolContext,
     session: SessionRuntime,
+    cancel_event: asyncio.Event | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """执行本轮 tool_calls；结果经 append_message 落盘。"""
     for tc in ordered_calls:
+        if _is_cancelled(cancel_event):
+            yield make_event(ERROR, error="cancelled")
+            return
         name = tc["function"]["name"]
         args = _parse_tool_input(tc["function"]["arguments"])
         yield make_event(TOOL_CALL, name=name, input=args)
@@ -296,8 +335,12 @@ async def run_agent(
     store: SessionStore,
     client: Any | None = None,
     ask_permission: Callable[[str], Awaitable[bool]] | None = None,
+    cancel_event: asyncio.Event | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """跑完一次用户请求的 ReAct，并流式产出产品事件。"""
+    """跑完一次用户请求的 ReAct，并流式产出产品事件。
+
+    cancel_event 被 set 后：停止后续模型请求与工具，已写入的 user 消息保留。
+    """
     _ = store
     session.tool_prune_chars = config.tool_prune_chars
     session.transcript_hard_cap = config.transcript_hard_cap
@@ -313,10 +356,13 @@ async def run_agent(
     )
     session.append_message({"role": "user", "content": bundle.user_text})
 
+    snapshots = SnapshotStore(session.data_dir, session.workspace_root)
+    snapshots.begin_turn()
     tool_ctx = ToolContext(
         workspace=session.workspace_root,
         data_home=config.data_home,
         ask_permission=ask_permission,
+        snapshot=snapshots,
     )
     openai_tools = registry.openai_tools() or None
 
@@ -326,6 +372,10 @@ async def run_agent(
     try:
         for _ in range(max_rounds):
             turn += 1
+            if _is_cancelled(cancel_event):
+                yield make_event(ERROR, error="cancelled")
+                yield make_event(DONE, total_turns=turn, total_tokens=total_tokens)
+                return
             # 即将送模前：预算检查（用户轮初 / 每个 tool 后）
             compacted = await ensure_context_budget(
                 session,
@@ -356,7 +406,7 @@ async def run_agent(
             finish_reason: str | None = None
             turn_tokens = 0
 
-            async for chunk in stream:
+            async for chunk in _iter_stream(stream, cancel_event):
                 usage = _usage_from_chunk(chunk)
                 if usage is not None:
                     turn_tokens += usage["input_tokens"] + usage["output_tokens"]
@@ -385,6 +435,11 @@ async def run_agent(
                 for tc in getattr(delta, "tool_calls", None) or []:
                     _merge_tool_delta(tool_calls_acc, tc)
 
+            if _is_cancelled(cancel_event):
+                yield make_event(ERROR, error="cancelled")
+                yield make_event(DONE, total_turns=turn, total_tokens=total_tokens)
+                return
+
             total_tokens += turn_tokens
             stop_reason = map_finish_reason(finish_reason)
             if tool_calls_acc and stop_reason == "end_turn":
@@ -405,8 +460,12 @@ async def run_agent(
                     registry=registry,
                     tool_ctx=tool_ctx,
                     session=session,
+                    cancel_event=cancel_event,
                 ):
                     yield event
+                    if event.get("type") == ERROR and event.get("error") == "cancelled":
+                        yield make_event(DONE, total_turns=turn, total_tokens=total_tokens)
+                        return
                 continue
 
             if assistant_text:
@@ -419,6 +478,7 @@ async def run_agent(
         yield make_event(ERROR, error=str(exc))
         yield make_event(DONE, total_turns=turn, total_tokens=total_tokens)
     finally:
+        snapshots.seal_turn()
         session.touch()
         session.write_context(model=config.model, fsync_transcript=True)
         # 刷新展示用 token 数

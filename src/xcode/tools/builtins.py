@@ -1,8 +1,8 @@
 """内置工具表（todo #7 按目标清单回填）。
 
 所有 execute 均为 async（供子进程 / HTTP 类工具复用）。
-已实现：read_file / write_file / edit_file / list_dir / glob / grep / bash / web_search / web_fetch / memory_read / memory_grep
-待回填：load_skill / search_code / revert_turn
+已实现：read_file / write_file / edit_file / list_dir / glob / grep / bash / web_search / web_fetch / memory_read / memory_grep / revert_turn
+待回填：search_code
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from xcode.memory import MemoryStore
+from xcode.skill import SkillRegistry
 from xcode.tools.base import Tool, ToolContext, ToolResult, resolve_workspace_path
 from xcode.web import fetch_url, search_web
 
@@ -39,6 +40,13 @@ _BASH_DENY_RULES: list[tuple[str, str]] = [
     ("shutdown", r"\b(?:shutdown|reboot|poweroff|halt)\b"),
 ]
 
+# 和 write_file / edit_file 抢活：软拦，提示换工具（快照只跟踪那两个）
+_BASH_OVERLAP_RULES: list[tuple[str, str]] = [
+    ("sed-inplace", r"\b(?:g?sed)\b[\s\S]*\s-i(?:[a-zA-Z0-9_.''\"]|\s|$)"),
+    ("perl-inplace", r"\bperl\b[\s\S]*\s-[a-zA-Z]*i"),
+    ("ruby-inplace", r"\bruby\b[\s\S]*\s-i(?:[a-zA-Z0-9_.]|\s|$)"),
+]
+
 
 def _bash_denied(command: str) -> str | None:
     """命中黑名单返回规则名，否则 None。"""
@@ -46,6 +54,23 @@ def _bash_denied(command: str) -> str | None:
         if re.search(pattern, command):
             return rule_name
     return None
+
+
+def _bash_overlap(command: str) -> str | None:
+    """命中「该用 write/edit」的原地改文件写法。"""
+    for rule_name, pattern in _BASH_OVERLAP_RULES:
+        if re.search(pattern, command):
+            return rule_name
+    return None
+
+
+def _note_snapshot(ctx: ToolContext, path: Path) -> None:
+    """改盘前登记原文；无 snapshot 时跳过（单测 / 无会话）。"""
+    store = getattr(ctx, "snapshot", None)
+    if store is None:
+        return
+    rel = path.relative_to(ctx.workspace.resolve()).as_posix()
+    store.note_before_write(rel)
 
 
 def _require_path(args: dict[str, Any], tool_name: str) -> str | ToolResult:
@@ -62,6 +87,25 @@ def _resolved_path(ctx: ToolContext, raw_path: str, tool_name: str):
         return resolve_workspace_path(ctx.workspace, raw_path)
     except PermissionError as exc:
         return ToolResult(f"{tool_name} error: {exc}", is_error=True)
+
+
+def _resolve_skill_read_path(ctx: ToolContext, raw_path: str) -> Path | ToolResult:
+    """允许读 skill 根下的附属文件（用户/内置 skill 不在工作区里）。"""
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        return ToolResult(f"read_file error: path outside workspace: {raw_path}", is_error=True)
+    try:
+        resolved = candidate.resolve()
+    except OSError as exc:
+        return ToolResult(f"read_file error: {exc}", is_error=True)
+    registry = SkillRegistry(ctx.workspace, data_home=ctx.data_home)
+    for root in registry.read_roots():
+        try:
+            resolved.relative_to(root.resolve())
+        except ValueError:
+            continue
+        return resolved
+    return ToolResult(f"read_file error: path outside workspace: {raw_path}", is_error=True)
 
 
 def _rel(ctx: ToolContext, path) -> str:
@@ -100,7 +144,9 @@ class ReadFileTool(Tool):
 
         path = _resolved_path(ctx, raw, self.name)
         if isinstance(path, ToolResult):
-            return path
+            path = _resolve_skill_read_path(ctx, raw)
+            if isinstance(path, ToolResult):
+                return path
 
         if not path.exists():
             return ToolResult(f"read_file error: file not found: {raw}", is_error=True)
@@ -156,6 +202,7 @@ class WriteFileTool(Tool):
             return ToolResult(f"write_file error: is a directory: {raw}", is_error=True)
 
         append = bool(args.get("append"))
+        _note_snapshot(ctx, path)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a" if append else "w", encoding="utf-8") as fh:
@@ -220,6 +267,7 @@ class EditFileTool(Tool):
                 is_error=True,
             )
 
+        _note_snapshot(ctx, path)
         try:
             path.write_text(text.replace(old, new, 1), encoding="utf-8")
         except OSError as exc:
@@ -466,7 +514,8 @@ class BashTool(Tool):
     name = "bash"
     description = (
         "Execute a shell command in the current workspace. "
-        "Captures stdout and stderr; the workspace is the working directory."
+        "For creating or editing source files use write_file / edit_file "
+        "(not sed -i / echo >). Prefer bash for tests, git, and builds."
     )
     parameters = {
         "type": "object",
@@ -489,6 +538,13 @@ class BashTool(Tool):
         if denied is not None:
             return ToolResult(
                 f"bash error: command blocked by deny-list ({denied})", is_error=True
+            )
+        overlap = _bash_overlap(command)
+        if overlap is not None:
+            return ToolResult(
+                f"bash error: {overlap} overlaps write_file/edit_file; "
+                "edit source files with those tools so snapshots can revert them",
+                is_error=True,
             )
 
         try:
@@ -670,6 +726,73 @@ class MemoryGrepTool(Tool):
         return ToolResult(store.grep(query.strip()))
 
 
+class LoadSkillTool(Tool):
+    """按名加载 SKILL.md 正文（L2）；附属文件仍走 read_file / bash。"""
+
+    name = "load_skill"
+    description = (
+        "Load a skill's instructions by name when the task matches a listed skill "
+        "or the user names one. Do not preload every skill. "
+        "After loading, use read_file for referenced docs and bash to run scripts "
+        "under the skill's Base directory."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Skill name"},
+            "args": {
+                "type": "string",
+                "description": "Optional arguments substituted for $ARGUMENTS",
+            },
+        },
+        "required": ["name"],
+    }
+
+    async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        name = args.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return ToolResult("load_skill error: name is required", is_error=True)
+        extra = args.get("args") or ""
+        if not isinstance(extra, str):
+            extra = str(extra)
+        registry = SkillRegistry(ctx.workspace, data_home=ctx.data_home)
+        text = registry.render(name.strip(), extra)
+        if text is None:
+            return ToolResult(
+                f"load_skill error: not found or disabled: {name.strip()}",
+                is_error=True,
+            )
+        return ToolResult(text)
+
+
+class RevertTurnTool(Tool):
+    """把上一轮 write_file/edit_file 改过的文件退回改前；不改对话。"""
+
+    name = "revert_turn"
+    requires_approval = True
+    description = (
+        "Revert workspace files changed by write_file/edit_file in the last "
+        "file-changing user turn. Does not change the conversation. "
+        "Ask the user before calling this."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    }
+
+    async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        _ = args
+        store = getattr(ctx, "snapshot", None)
+        if store is None:
+            return ToolResult("revert_turn error: snapshot store not available", is_error=True)
+        report = store.restore_last()
+        text = report.format()
+        if text == "nothing to restore":
+            return ToolResult("revert_turn: nothing to revert (no last-turn snapshot)")
+        return ToolResult(f"revert_turn:\n{text}")
+
+
 def builtin_tools() -> list[Tool]:
     """返回当前已实现的内置工具。"""
     return [
@@ -684,4 +807,6 @@ def builtin_tools() -> list[Tool]:
         WebFetchTool(),
         MemoryReadTool(),
         MemoryGrepTool(),
+        LoadSkillTool(),
+        RevertTurnTool(),
     ]

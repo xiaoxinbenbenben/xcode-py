@@ -9,6 +9,7 @@
     meta.json            # 名片：id、标题、workspace、时间
     transcript.jsonl     # 权威：只追加事件（message / compact）
     context.json         # 缓存：当前送模 messages + 书签（byte_offset 等）
+    snapshots/           # write/edit 文件快照（见 runtime/snapshot.py）
   同级 current_session.json  # 项目「上次打开的是哪个 session」
 
 ## 两条数据路径（必须分清）
@@ -200,6 +201,9 @@ class SessionMeta:
     created_at: str
     last_active_at: str
     default_name: bool = True
+    user_turns: int = 0
+    message_count: int = 0
+    preview: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -209,6 +213,9 @@ class SessionMeta:
             "created_at": self.created_at,
             "last_active_at": self.last_active_at,
             "default_name": self.default_name,
+            "user_turns": self.user_turns,
+            "message_count": self.message_count,
+            "preview": self.preview,
         }
 
     @classmethod
@@ -220,6 +227,9 @@ class SessionMeta:
             created_at=str(data["created_at"]),
             last_active_at=str(data["last_active_at"]),
             default_name=bool(data.get("default_name", True)),
+            user_turns=int(data.get("user_turns") or 0),
+            message_count=int(data.get("message_count") or 0),
+            preview=str(data.get("preview") or ""),
         )
 
 
@@ -291,6 +301,7 @@ class SessionRuntime:
         4. 同步写 meta 与 current_session 指针
         5. 可选 fsync transcript，降低整轮结束时丢尾部风险
         """
+        self.refresh_meta_stats()
         self.estimated_tokens = count_messages_tokens(self.messages, model=model)
         payload = {
             "schema_version": 1,
@@ -312,6 +323,21 @@ class SessionRuntime:
                     os.fsync(fh.fileno())
                 except OSError:
                     pass
+
+    def refresh_meta_stats(self) -> None:
+        """用当前送模窗口刷新列表要用的轮次 / 预览。"""
+
+        self.meta.message_count = len(self.messages)
+        previews: list[str] = []
+        for msg in self.messages:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str) or content.startswith("<compact_summary>"):
+                continue
+            previews.append(" ".join(content.split()))
+        self.meta.user_turns = len(previews)
+        self.meta.preview = (previews[-1] if previews else "")[:80]
 
     def save(self) -> None:
         """兼容旧调用：写 context + meta（不重复写 transcript）。"""
@@ -756,9 +782,98 @@ class SessionStore:
             meta_path = child / META_NAME
             if not meta_path.is_file():
                 continue
-            items.append(SessionMeta.from_dict(json.loads(meta_path.read_text(encoding="utf-8"))))
+            try:
+                meta = SessionMeta.from_dict(json.loads(meta_path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError, KeyError):
+                continue
+            if meta.message_count == 0 and meta.preview == "":
+                self._hydrate_meta_from_context(child, meta)
+            items.append(meta)
         items.sort(key=lambda m: m.last_active_at, reverse=True)
         return items
+
+    @staticmethod
+    def _hydrate_meta_from_context(child: Path, meta: SessionMeta) -> None:
+        """旧会话 meta 没有轮次字段时，从 context.json 补一版给列表用。"""
+
+        ctx_path = child / CONTEXT_NAME
+        if not ctx_path.is_file():
+            return
+        try:
+            data = json.loads(ctx_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        messages = data.get("messages") if isinstance(data, dict) else None
+        if not isinstance(messages, list):
+            return
+        meta.message_count = len(messages)
+        previews: list[str] = []
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str) or content.startswith("<compact_summary>"):
+                continue
+            previews.append(" ".join(content.split()))
+        meta.user_turns = len(previews)
+        if previews and not meta.preview:
+            meta.preview = previews[-1][:80]
+
+    def find_session_id(self, workspace: Path, query: str) -> str:
+        """按完整 id / 唯一前缀 / 唯一后缀 / 列表序号（1-based）解析会话 id。
+
+        找不到或多义时抛 ValueError（带可读说明）。
+        """
+        q = (query or "").strip()
+        if not q:
+            raise ValueError("empty session query")
+        items = self.list_sessions(workspace)
+        if not items:
+            raise ValueError("no sessions in this workspace")
+
+        # 1-based index from /sessions listing order
+        if q.isdigit():
+            idx = int(q)
+            if 1 <= idx <= len(items):
+                return items[idx - 1].session_id
+            raise ValueError(f"index out of range: {idx} (1..{len(items)})")
+
+        # exact
+        for meta in items:
+            if meta.session_id == q:
+                return meta.session_id
+
+        # unique prefix (e.g. sess-3ab0) or unique suffix (toolbar shows last 8)
+        prefix_hits = [m.session_id for m in items if m.session_id.startswith(q)]
+        if len(prefix_hits) == 1:
+            return prefix_hits[0]
+        if len(prefix_hits) > 1:
+            raise ValueError(
+                "ambiguous prefix; matches: " + ", ".join(prefix_hits[:5])
+            )
+
+        suffix_hits = [m.session_id for m in items if m.session_id.endswith(q)]
+        if len(suffix_hits) == 1:
+            return suffix_hits[0]
+        if len(suffix_hits) > 1:
+            raise ValueError(
+                "ambiguous suffix; matches: " + ", ".join(suffix_hits[:5])
+            )
+
+        needle = q.casefold()
+        name_hits = [m for m in items if needle in (m.name or "").casefold()]
+        if len(name_hits) == 1:
+            return name_hits[0].session_id
+        if len(name_hits) > 1:
+            exact = [m for m in name_hits if (m.name or "").casefold() == needle]
+            if len(exact) == 1:
+                return exact[0].session_id
+            raise ValueError(
+                "ambiguous title; matches: "
+                + ", ".join(f"{m.name} ({m.session_id[-8:]})" for m in name_hits[:5])
+            )
+
+        raise ValueError(f"session not found: {q}")
 
     def resolve(
         self,
@@ -775,7 +890,12 @@ class SessionStore:
         if new_session:
             return self.create(workspace)
         if session_id:
-            return self.load(workspace, session_id)
+            # 允许前缀/后缀/序号，与 TUI /resume 一致
+            try:
+                sid = self.find_session_id(workspace, session_id)
+            except ValueError:
+                sid = session_id
+            return self.load(workspace, sid)
         pointer = self.sessions_dir(workspace) / "current_session.json"
         if pointer.is_file():
             data = json.loads(pointer.read_text(encoding="utf-8"))

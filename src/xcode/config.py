@@ -41,6 +41,51 @@ def default_data_home() -> Path:
     return Path.home() / ".xcode"
 
 
+def _load_dotenv_layers(
+    *,
+    project_root: Path,
+    env_file: Path | None = None,
+) -> list[Path]:
+    """分层加载 .env：``override=False``，已存在的变量不被后文件覆盖。
+
+    加载顺序（**先加载的优先**，后加载的只补还没设置的键）：
+    1. 显式 ``env_file``
+    2. 工作区 ``project_root/.env``、``cwd/.env``（业务项目常有自己的 .env）
+    3. ``$XCODE_HOME/.env``、``~/.xcode/.env``（推荐放 OPENAI_*）
+    4. 源码树 ``xcode-py/.env``（editable 开发时兜底）
+
+    旧逻辑「找到第一个文件就 break」的问题：在 ``knowledge_search`` 下启动时，
+    会只读到业务项目的 .env（只有 API_KEY / EMBEDDING_*，没有 OPENAI_*），
+    于是 model 默认 gpt-4o-mini、api_key 为空，请求变成字面量 key ``missing`` 的 401。
+    """
+    loaded: list[Path] = []
+    xcode_home = Path(os.getenv("XCODE_HOME", str(default_data_home()))).expanduser()
+    # Path(__file__) = .../src/xcode/config.py → parents[2] = 仓库根（editable 安装）
+    repo_env = Path(__file__).resolve().parents[2] / ".env"
+    candidates = [
+        env_file,
+        project_root / ".env",
+        Path.cwd() / ".env",
+        xcode_home / ".env",
+        default_data_home() / ".env",
+        repo_env,
+    ]
+    seen: set[Path] = set()
+    for path in candidates:
+        if path is None:
+            continue
+        try:
+            resolved = path.expanduser().resolve()
+        except OSError:
+            continue
+        if resolved in seen or not resolved.is_file():
+            continue
+        seen.add(resolved)
+        load_dotenv(resolved, override=False)
+        loaded.append(resolved)
+    return loaded
+
+
 def load_config(
     *,
     project_root: Path | None = None,
@@ -48,19 +93,11 @@ def load_config(
 ) -> Config:
     """加载配置。
 
-    输入：可选项目根与 .env 路径；副作用：若存在则 load_dotenv。
-    输出：Config 实例（缺 key 时 api_key 为空字符串，由 doctor/运行时再提示）。
+    输入：可选项目根与 .env 路径；副作用：分层 load_dotenv。
+    输出：Config 实例（缺 key 时 api_key 为空字符串，启动时应明确报错）。
     """
     root = (project_root or Path.cwd()).resolve()
-    candidates = [
-        env_file,
-        root / ".env",
-        Path.cwd() / ".env",
-    ]
-    for path in candidates:
-        if path is not None and path.is_file():
-            load_dotenv(path, override=False)
-            break
+    _load_dotenv_layers(project_root=root, env_file=env_file)
 
     data_home = Path(os.getenv("XCODE_HOME", str(default_data_home()))).expanduser()
 
