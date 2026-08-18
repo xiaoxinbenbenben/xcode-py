@@ -6,6 +6,7 @@
 - 一轮结束后 → _submit_round：slice_round → MemoryPipeline.submit（后台 stage1/2）
 - 退出 finally → registry.drain_all：尽量把记忆队列刷完
 - /compact：强制会话压缩；/memory *：读或 clear 长期记忆；无 /clear 会话
+- /mcp：只看 MCP server 状态（进场后台连，不挡输入框）
 - /resume 无参：选择器；启动空会话不回放；切入旧会话后回放并按 Markdown 渲染
 """
 
@@ -41,6 +42,7 @@ from xcode.entrypoints.session_picker import (
     format_session_line,
 )
 from xcode.memory import MemoryStore, PipelineRegistry, should_extract, slice_round
+from xcode.mcp import McpClientManager
 from xcode.runtime.agent import build_registry, run_agent, run_compact
 from xcode.runtime.session import SessionRuntime, SessionStore
 from xcode.runtime.snapshot import SnapshotStore
@@ -165,11 +167,20 @@ def _build_registry(config: Config) -> PipelineRegistry | None:
     )
 
 
-async def _confirm(prompt: PromptSession, question: str) -> bool:
-    """y/N 确认；Ctrl-C / 空输入视为否。"""
+async def _confirm(question: str) -> bool:
+    """y/N 确认；Ctrl-C / 空输入视为否。
 
+    必须另开一个极简 PromptSession。复用主输入框的话，bottom_toolbar
+    会按「光标到屏底」把中间整块撑空，补全菜单再额外留白。
+    """
+    session = PromptSession(
+        style=_PT_STYLE,
+        multiline=False,
+        completer=None,
+        reserve_space_for_menu=0,
+    )
     try:
-        answer = await prompt.prompt_async(
+        answer = await session.prompt_async(
             HTML(f"<b><style fg='#ffb454'>⚠ {question} [y/N] </style></b>")
         )
     except (EOFError, KeyboardInterrupt):
@@ -187,6 +198,7 @@ async def _run_agent_turn(
     renderer: "_EventRenderer",
     ask_permission,
     cancel_event: asyncio.Event,
+    mcp_manager: McpClientManager | None = None,
 ) -> None:
     """跑一轮 agent。SIGINT 只置 cancel_event，不让 asyncio.run 把整个 TUI 掀掉。"""
 
@@ -210,6 +222,7 @@ async def _run_agent_turn(
             store=store,
             ask_permission=ask_permission,
             cancel_event=cancel_event,
+            mcp_manager=mcp_manager,
         ):
             renderer.render(event)
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -256,6 +269,9 @@ async def start_tui(
     _banner(console, config=config, session=session)
     _print_replay(console, session)
     registry = _build_registry(config)
+    # 进场并行连 MCP，不挡输入框；第一轮用当时已连上的
+    mcp = McpClientManager(workspace=session.workspace_root, data_home=config.data_home)
+    mcp_task = asyncio.create_task(mcp.start())
     completer = XcodeCompleter(session.workspace_root)
     last_renderer: _EventRenderer | None = None
 
@@ -294,6 +310,7 @@ async def start_tui(
                     memory_registry=registry,
                     prompt=prompt,
                     last_renderer=last_renderer,
+                    mcp_manager=mcp,
                 )
                 if result.exit:
                     console.print(Text("bye", style="dim"))
@@ -315,7 +332,7 @@ async def start_tui(
 
             async def _ask_permission(question: str) -> bool:
                 """审批回调：仅 requires_approval 的工具执行前询问。"""
-                return await _confirm(prompt, question)
+                return await _confirm(question)
 
             cancel_event = asyncio.Event()
             await _run_agent_turn(
@@ -327,6 +344,7 @@ async def start_tui(
                 renderer=renderer,
                 ask_permission=_ask_permission,
                 cancel_event=cancel_event,
+                mcp_manager=mcp,
             )
             _submit_round(registry, session)
             session.estimated_tokens = count_messages_tokens(
@@ -336,6 +354,13 @@ async def start_tui(
             prompt.bottom_toolbar = _toolbar(config, session, turns)
             console.print()
     finally:
+        if not mcp_task.done():
+            mcp_task.cancel()
+            try:
+                await mcp_task
+            except asyncio.CancelledError:
+                pass
+        await mcp.aclose()
         if registry is not None:
             await registry.drain_all()
 
@@ -375,6 +400,7 @@ async def _handle_slash(
     memory_registry: PipelineRegistry | None = None,
     prompt: PromptSession | None = None,
     last_renderer: "_EventRenderer | None" = None,
+    mcp_manager: McpClientManager | None = None,
 ) -> _SlashResult:
     """处理 slash；exit=True 退出 TUI；session 非空则主循环切换会话。"""
     cmd, _, arg = text.partition(" ")
@@ -455,7 +481,8 @@ async def _handle_slash(
         console.print(Text(preview, style="dim"))
         return _SlashResult()
     if cmd == "/tools":
-        names = build_registry(session.workspace_root).list_names()
+        extra = mcp_manager.tools() if mcp_manager is not None else None
+        names = build_registry(session.workspace_root, extra_tools=extra).list_names()
         console.print(", ".join(names) if names else "(none)")
         return _SlashResult()
     if cmd == "/status":
@@ -494,6 +521,12 @@ async def _handle_slash(
         return _SlashResult()
     if cmd == "/skills":
         return _handle_skills(arg, console=console, config=config, session=session)
+    if cmd == "/mcp":
+        if mcp_manager is None:
+            console.print("[dim](no mcp servers)[/]")
+        else:
+            console.print(mcp_manager.status_text())
+        return _SlashResult()
     console.print(f"[yellow]unknown command:[/] {cmd}  (try /help)")
     _ = arg
     return _SlashResult()
@@ -557,7 +590,7 @@ async def _handle_restore(
         return _SlashResult()
     if prompt is not None:
         n = len(snaps.capture_session_now())
-        if not await _confirm(prompt, f"restore {target} · 将覆盖约 {n} 个已跟踪文件"):
+        if not await _confirm(f"restore {target} · 将覆盖约 {n} 个已跟踪文件"):
             console.print(Text("cancelled", style="dim"))
             return _SlashResult()
     try:
@@ -743,7 +776,7 @@ async def _handle_memory(
         console.print(store.grep(rest.strip()))
         return False
     if sub == "clear":
-        if prompt is not None and not await _confirm(prompt, "清空本项目长期记忆"):
+        if prompt is not None and not await _confirm("清空本项目长期记忆"):
             console.print(Text("cancelled", style="dim"))
             return False
         if memory_registry is not None:
@@ -912,9 +945,17 @@ async def run_once(
     console = Console()
     code = 0
     registry = _build_registry(config)
+    mcp = McpClientManager(workspace=session.workspace_root, data_home=config.data_home)
     renderer = _EventRenderer(console)
     try:
-        async for event in run_agent(prompt, config=config, session=session, store=store):
+        await mcp.start()
+        async for event in run_agent(
+            prompt,
+            config=config,
+            session=session,
+            store=store,
+            mcp_manager=mcp,
+        ):
             if json_events:
                 console.print_json(json.dumps(event, ensure_ascii=False))
             else:
@@ -922,6 +963,7 @@ async def run_once(
             if event.get("type") == "error":
                 code = 1
     finally:
+        await mcp.aclose()
         _submit_round(registry, session)
         if registry is not None:
             await registry.drain_all()

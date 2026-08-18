@@ -6,7 +6,12 @@ from io import StringIO
 
 from rich.console import Console
 
-from xcode.entrypoints.tui import _EventRenderer, _build_key_bindings, _short_tool_preview
+from xcode.entrypoints.tui import (
+    _EventRenderer,
+    _build_key_bindings,
+    _confirm,
+    _short_tool_preview,
+)
 
 
 def _console() -> tuple[Console, StringIO]:
@@ -122,3 +127,27 @@ def test_answer_streams_each_delta_once():
     assert "· answer" in out
     assert out.count("Review 完成。") == 1
     assert out.count("## 代码审查报告") == 1
+
+
+def test_confirm_uses_compact_session_without_toolbar(monkeypatch):
+    """审批必须另开一行 prompt。复用主会话的 bottom_toolbar 会按光标到屏底撑出一整块空白。"""
+    import asyncio
+
+    seen: list[dict] = []
+
+    class _FakeSession:
+        def __init__(self, **kwargs):
+            seen.append(kwargs)
+
+        async def prompt_async(self, *args, **kwargs):
+            _ = args, kwargs
+            return "y"
+
+    monkeypatch.setattr("xcode.entrypoints.tui.PromptSession", _FakeSession)
+    assert asyncio.run(_confirm("允许工具 webSearchStd 执行？")) is True
+    assert seen
+    kw = seen[0]
+    assert not kw.get("bottom_toolbar")
+    assert kw.get("multiline") is False
+    assert kw.get("reserve_space_for_menu", 0) == 0
+    assert kw.get("completer") is None

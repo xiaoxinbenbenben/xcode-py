@@ -55,10 +55,15 @@ _COMPACT_SYSTEM = """你是会话交接摘要器。根据对话历史写一份�
 只输出摘要正文，不要前言。"""
 
 
-def build_registry(workspace=None, *, package_skills=None) -> ToolRegistry:
-    """组装工具表（todo #7 回填中）。"""
+def build_registry(
+    workspace=None, *, package_skills=None, extra_tools=None
+) -> ToolRegistry:
+    """组装工具表：内置 + 可选 MCP 等 extra。"""
     _ = workspace, package_skills
-    return ToolRegistry(builtin_tools())
+    tools = list(builtin_tools())
+    if extra_tools:
+        tools.extend(extra_tools)
+    return ToolRegistry(tools)
 
 
 def _usage_from_chunk(chunk: Any) -> dict[str, int] | None:
@@ -336,16 +341,19 @@ async def run_agent(
     client: Any | None = None,
     ask_permission: Callable[[str], Awaitable[bool]] | None = None,
     cancel_event: asyncio.Event | None = None,
+    mcp_manager: Any | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """跑完一次用户请求的 ReAct，并流式产出产品事件。
 
     cancel_event 被 set 后：停止后续模型请求与工具，已写入的 user 消息保留。
+    mcp_manager：已 start 的 MCP Client，其 tools() 并进 registry。
     """
     _ = store
     session.tool_prune_chars = config.tool_prune_chars
     session.transcript_hard_cap = config.transcript_hard_cap
     session.update_name_from_user_input(user_input)
-    registry = build_registry(session.workspace_root)
+    extra = mcp_manager.tools() if mcp_manager is not None else None
+    registry = build_registry(session.workspace_root, extra_tools=extra)
     llm = client or AsyncOpenAI(api_key=config.api_key or "missing", base_url=config.base_url)
     bundle = build_context_bundle(
         user_input=user_input,

@@ -5,7 +5,6 @@
 
 ### **L1 单智能体内核**
 
-3. **LLM Provider** — OpenAI-compatible 流式、多 provider key、能力探测
 4. **ReAct Loop** — 主循环、多轮 tool、停止条件
 5. **Prompt 组装** — 系统提示、工具说明、项目记忆文件（根目录 `XCODE.md` + `XCODE.local.md`）
    - 本轮不做、回头挂靠：Skill 索引→**13**；SQLite 长期记忆→**11**（现仍 JSONL）；工具改名文案→**7**；summary/mention 从 system 收口→**6**
@@ -30,7 +29,7 @@
 ### **L3 扩展**
 
 13. **Skills** — 内置/用户/项目、启停、懒注入缓冲
-14. **MCP** — Client + 自身 Server + `/mcp`
+14. **MCP** — Client + resources 虚工具 + `/mcp`（只看）
 15. **代码索引（可选）** — 供 `search_code`；非向量 RAG 必选项
 16. **多模态** — 图片预处理与降级
 
@@ -62,7 +61,6 @@
 ```
 1 安装
  → 2 事件协议
- → 3 LLM Provider
  → 4 ReAct Loop
  → 5 Prompt 组装
  → 6 上下文治理
@@ -92,7 +90,6 @@
 | :----- | :----------------------------- |
 | **1** | `uv sync` / `pip install -e .` 后可用 `xcode` 与 `python -m xcode` 启动（配置继续用 `.env`） |
 | **2** | 事件类型与字段定稿，入口只认这一套 ✅ |
-| **3** | OpenAI-compatible 流式可用；按配置创建客户端 |
 | **4** | 纯 ReAct 多轮 tool，停止条件明确 |
 | **5** | 系统提示含 cwd/工具/项目说明（`XCODE.md` + `XCODE.local.md`） ✅ |
 | **6** | 长对话可控（预算/压缩/mention 生效） |
@@ -103,7 +100,7 @@
 | **11** | SQLite 长期记忆按 scope 可用 |
 | **12** | turn 快照与 `/snapshot` `/restore` 可用 |
 | **13** | 内置/用户/项目 Skills 启停与懒注入可用 |
-| **14** | MCP Client（及可选 Server）与内置工具同一 Loop |
+| **14** | MCP Client + resources 虚工具与内置工具同一 Loop；`/mcp` 只看 |
 | **15** | （可选）索引可供 `search_code` |
 | **16** | 图片输入可预处理，不支持时降级 |
 | **17** | `/plan`（或等价）真跑通 |

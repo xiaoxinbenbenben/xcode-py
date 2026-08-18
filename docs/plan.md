@@ -131,3 +131,47 @@ bash
 | 驻留 | 无单独缓冲 | 正文就是对话里的一条 tool 结果。compact 只压对话窗口，不通知、不强制重载；还要用就靠 catalog 再 `load_skill`，和第一次一样 |
 | 刷新 | 用到再看 mtime | 每轮组 catalog、`/skills`、`load_skill` 时比修改时间；变了重扫。不 watch、不要求用户先敲 `/skills` |
 
+## MCP
+
+拍板：2026-08-15。只做 Client；resources 用虚工具进同一 Loop。不抽 `llm/` Provider（已移出规划）。
+
+### 决策表
+
+| 决策点 | 选定方案 | 说明 |
+|---|---|---|
+| 范围 | Client + resources 虚工具 | 不做 prompts 虚工具；不做自己当 MCP Server |
+| 真工具 | server 的 `tools/list` | 挂进现有 registry，和 `read_file` 同一 ReAct |
+| 虚工具 | `mcp__{server}__list_resources` / `read_resource` | 对模型是 tool；内部打 `resources/list`、`resources/read`。连上成功才注册 |
+| 连接 | 长连接 | TUI / `-p` 生命周期内 initialize 一次，复用 session |
+| 何时连 | 进 TUI / 开始 `-p` 就并行连 | 输入框不空等；`-p` 等到连接超时再送第一轮。`--version` / `doctor` 不连 |
+| 配置 | `~/.xcode/mcp.json` + `<ws>/.xcode/mcp.json` | `mcpServers` 格式；项目同名整条盖用户。不扫 `.claude` / 项目根 `.mcp.json` |
+| 传输 | stdio + streamable HTTP | 本地进程 vs URL；不做 SSE |
+| 命名 | `mcp__{server}__{原名}` | 不撞内置；server 之间同名也不撞 |
+| 审批 | 跟 `readOnlyHint` | `true` 不问；没有标注当危险。`-p` 该问的拒。v1 无白名单 |
+| 人入口 | `/mcp` 只看 | 状态 / 工具数 / 错误。无 on/off/reload/add。关掉：json 里 `enabled: false` 再开一次 |
+| 进场失败 | 隔离 | 真工具、虚工具都不进表；其它 server 照常 |
+| 中途断 | 下次 `execute` 抢一轮 | stdio 与 HTTP 都救；401 / 404 / 坏 command 不抢。救不活这条报错，`/mcp` 标 disconnected |
+| 超时 | 连接 30s；调用 60s | `"timeout"` 只盖单次调用 |
+| 展开 | `${HOME}` `${PROJECT_DIR}` 环境变量 | 缺的键变空串；因此连不上走隔离 |
+| 默认 | stdio 继承环境 + 叠 `env`；`cwd` = workspace | 官方 `mcp` SDK |
+
+### 调用链
+
+```
+进 TUI / 开始 -p
+  → 读 ~/.xcode/mcp.json + <ws>/.xcode/mcp.json（项目同名盖用户）
+  → enabled 的 server 并行 initialize（30s）
+  → 成功：tools/list + 一对虚工具 → registry
+  → 失败：/mcp 记 failed；不进表
+
+模型调 mcp__github__list_issues
+  → registry → execute → 已有 session 上 tools/call
+  → session 死了：再 initialize 一次；401/404/坏命令不重试
+
+模型调 mcp__postgres__read_resource({uri})
+  → 同一 session 上 resources/read（不是 tools/call）
+
+/mcp
+  → 只打印配置里的 server、连没连上、工具数、错误
+```
+

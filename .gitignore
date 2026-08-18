@@ -16,6 +16,9 @@ artifacts/
 .tmp-xcode-home/
 node_modules/
 uv.lock
+.zcode/
+docs/
+openspec/
 
 # Reference clones — do not publish
 PaiCLI-Python/
