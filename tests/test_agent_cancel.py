@@ -64,7 +64,6 @@ def test_run_agent_stops_when_cancel_event_set(tmp_path: Path):
             "hello cancel",
             config=config,
             session=session,
-            store=store,
             client=client,
             cancel_event=cancel,
         ):

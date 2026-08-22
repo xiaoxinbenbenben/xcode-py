@@ -1,14 +1,4 @@
-"""交互层：TUI banner / prompt / slash / 流式渲染。
-
-## 与会话、记忆的接线（读 slash 与主循环时对照）
-- 启动：外部传入已 resolve 的 SessionRuntime（transcript/context 已 load）
-- 每轮用户输入非 slash → run_agent（内部 append_message + 可能 compact）
-- 一轮结束后 → _submit_round：slice_round → MemoryPipeline.submit（后台 stage1/2）
-- 退出 finally → registry.drain_all：尽量把记忆队列刷完
-- /compact：强制会话压缩；/memory *：读或 clear 长期记忆；无 /clear 会话
-- /mcp：只看 MCP server 状态（进场后台连，不挡输入框）
-- /resume 无参：选择器；启动空会话不回放；切入旧会话后回放并按 Markdown 渲染
-"""
+"""交互 TUI：slash 本地处理，其余交给 run_agent。"""
 
 from __future__ import annotations
 
@@ -42,6 +32,7 @@ from xcode.entrypoints.session_picker import (
     format_session_line,
 )
 from xcode.memory import MemoryStore, PipelineRegistry, should_extract, slice_round
+from xcode.code_index import CodeIndexManager
 from xcode.mcp import McpClientManager
 from xcode.runtime.agent import build_registry, run_agent, run_compact
 from xcode.runtime.session import SessionRuntime, SessionStore
@@ -194,11 +185,11 @@ async def _run_agent_turn(
     console: Console,
     config: Config,
     session: SessionRuntime,
-    store: SessionStore,
     renderer: "_EventRenderer",
     ask_permission,
     cancel_event: asyncio.Event,
     mcp_manager: McpClientManager | None = None,
+    code_index: CodeIndexManager | None = None,
 ) -> None:
     """跑一轮 agent。SIGINT 只置 cancel_event，不让 asyncio.run 把整个 TUI 掀掉。"""
 
@@ -219,10 +210,10 @@ async def _run_agent_turn(
             text,
             config=config,
             session=session,
-            store=store,
             ask_permission=ask_permission,
             cancel_event=cancel_event,
             mcp_manager=mcp_manager,
+            code_index=code_index,
         ):
             renderer.render(event)
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -272,6 +263,8 @@ async def start_tui(
     # 进场并行连 MCP，不挡输入框；第一轮用当时已连上的
     mcp = McpClientManager(workspace=session.workspace_root, data_home=config.data_home)
     mcp_task = asyncio.create_task(mcp.start())
+    indexer = CodeIndexManager(workspace=session.workspace_root, data_home=config.data_home)
+    index_task = asyncio.create_task(indexer.start())
     completer = XcodeCompleter(session.workspace_root)
     last_renderer: _EventRenderer | None = None
 
@@ -311,6 +304,7 @@ async def start_tui(
                     prompt=prompt,
                     last_renderer=last_renderer,
                     mcp_manager=mcp,
+                    index_manager=indexer,
                 )
                 if result.exit:
                     console.print(Text("bye", style="dim"))
@@ -340,11 +334,11 @@ async def start_tui(
                 console=console,
                 config=config,
                 session=session,
-                store=store,
                 renderer=renderer,
                 ask_permission=_ask_permission,
                 cancel_event=cancel_event,
                 mcp_manager=mcp,
+                code_index=indexer,
             )
             _submit_round(registry, session)
             session.estimated_tokens = count_messages_tokens(
@@ -361,6 +355,13 @@ async def start_tui(
             except asyncio.CancelledError:
                 pass
         await mcp.aclose()
+        if not index_task.done():
+            index_task.cancel()
+            try:
+                await index_task
+            except asyncio.CancelledError:
+                pass
+        await indexer.aclose()
         if registry is not None:
             await registry.drain_all()
 
@@ -401,6 +402,7 @@ async def _handle_slash(
     prompt: PromptSession | None = None,
     last_renderer: "_EventRenderer | None" = None,
     mcp_manager: McpClientManager | None = None,
+    index_manager: CodeIndexManager | None = None,
 ) -> _SlashResult:
     """处理 slash；exit=True 退出 TUI；session 非空则主循环切换会话。"""
     cmd, _, arg = text.partition(" ")
@@ -482,7 +484,7 @@ async def _handle_slash(
         return _SlashResult()
     if cmd == "/tools":
         extra = mcp_manager.tools() if mcp_manager is not None else None
-        names = build_registry(session.workspace_root, extra_tools=extra).list_names()
+        names = build_registry(extra_tools=extra).list_names()
         console.print(", ".join(names) if names else "(none)")
         return _SlashResult()
     if cmd == "/status":
@@ -508,6 +510,7 @@ async def _handle_slash(
             console=console,
             session=session,
             prompt=prompt,
+            index_manager=index_manager,
         )
     if cmd == "/memory":
         await _handle_memory(
@@ -526,6 +529,12 @@ async def _handle_slash(
             console.print("[dim](no mcp servers)[/]")
         else:
             console.print(mcp_manager.status_text())
+        return _SlashResult()
+    if cmd == "/index":
+        if index_manager is None:
+            console.print("[dim](no code index)[/]")
+        else:
+            console.print(index_manager.status_text())
         return _SlashResult()
     console.print(f"[yellow]unknown command:[/] {cmd}  (try /help)")
     _ = arg
@@ -577,6 +586,7 @@ async def _handle_restore(
     console: Console,
     session: SessionRuntime,
     prompt: PromptSession | None = None,
+    index_manager: CodeIndexManager | None = None,
 ) -> _SlashResult:
     snaps = _snapshot_store(session)
     if not target:
@@ -607,6 +617,13 @@ async def _handle_restore(
     except OSError as exc:
         console.print(f"[red]restore failed:[/] {exc}")
         return _SlashResult()
+    if index_manager is not None:
+        changed = [
+            session.workspace_root / rel
+            for rel in [*report.restored, *report.deleted]
+        ]
+        if changed:
+            await index_manager.refresh_paths(changed)
     console.print(Text(report.format(), style="dim #5dffa8"))
     return _SlashResult()
 
@@ -651,9 +668,6 @@ def _handle_resume(
     store: SessionStore,
 ) -> _SlashResult:
     """按 query 切入已有会话。"""
-    if not query:
-        _print_sessions(console, store=store, session=session)
-        return _SlashResult()
     try:
         sid = store.find_session_id(session.workspace_root, query)
     except ValueError as exc:
@@ -719,14 +733,8 @@ async def _handle_memory(
     session: SessionRuntime,
     memory_registry: PipelineRegistry | None = None,
     prompt: PromptSession | None = None,
-) -> bool:
-    """/memory 子命令：查看或清空**长期记忆**（不是会话 transcript）。
-
-    - summary/path/show/grep：只读 MemoryStore
-    - clear：PipelineRegistry.clear_workspace → epoch 作废在途任务 + 删文件重建模板
-      必须先作废 pipeline，否则后台 stage2 可能把旧内容写回空目录
-    项目规范请写 XCODE.md，勿把 MEMORY 当人工配置文件。
-    """
+) -> None:
+    """/memory：读或清空长期记忆（不是会话 transcript）。clear 先作废 pipeline 再删文件。"""
     store = MemoryStore(config.data_home, session.workspace_root)
     store.ensure_layout()
     sub, _, rest = arg.partition(" ")
@@ -759,11 +767,11 @@ async def _handle_memory(
                     style="dim",
                 )
             )
-        return False
+        return
     if sub == "path":
         console.print(str(store.root))
         console.print("[dim]generated state — project conventions → XCODE.md[/]")
-        return False
+        return
     if sub == "show":
         which = rest.strip().lower() or "summary"
         rel = "MEMORY.md" if which in {"memory", "mem"} else "memory_summary.md"
@@ -771,26 +779,25 @@ async def _handle_memory(
             console.print(store.read_rel(rel))
         except FileNotFoundError:
             console.print(f"[yellow]missing {rel}[/]")
-        return False
+        return
     if sub == "grep" and rest.strip():
         console.print(store.grep(rest.strip()))
-        return False
+        return
     if sub == "clear":
         if prompt is not None and not await _confirm("清空本项目长期记忆"):
             console.print(Text("cancelled", style="dim"))
-            return False
+            return
         if memory_registry is not None:
             memory_registry.clear_workspace(session.workspace_root)
         else:
             store.clear()
         console.print("[dim]cleared memories (pipeline invalidated, templates restored)[/]")
-        return False
+        return
     console.print(
         "[yellow]usage:[/] /memory [summary|path|show memory|show summary|grep <q>|clear]\n"
         "[dim]/memory = summary（注入 system）；/memory show memory = MEMORY.md 注册表[/]\n"
         "[dim]memories are generated; put project conventions in XCODE.md[/]"
     )
-    return False
 
 
 def _short_tool_preview(name: str | None, args: dict[str, Any], *, limit: int = 72) -> str:
@@ -935,7 +942,6 @@ async def run_once(
     *,
     config: Config,
     session: SessionRuntime,
-    store: SessionStore,
     json_events: bool = False,
 ) -> int:
     """跑一次 `-p`：消费 run_agent 事件并打印；结束前同步等记忆抽取落库。
@@ -946,15 +952,17 @@ async def run_once(
     code = 0
     registry = _build_registry(config)
     mcp = McpClientManager(workspace=session.workspace_root, data_home=config.data_home)
+    indexer = CodeIndexManager(workspace=session.workspace_root, data_home=config.data_home)
     renderer = _EventRenderer(console)
     try:
         await mcp.start()
+        await indexer.start()
         async for event in run_agent(
             prompt,
             config=config,
             session=session,
-            store=store,
             mcp_manager=mcp,
+            code_index=indexer,
         ):
             if json_events:
                 console.print_json(json.dumps(event, ensure_ascii=False))
@@ -964,6 +972,7 @@ async def run_once(
                 code = 1
     finally:
         await mcp.aclose()
+        await indexer.aclose()
         _submit_round(registry, session)
         if registry is not None:
             await registry.drain_all()

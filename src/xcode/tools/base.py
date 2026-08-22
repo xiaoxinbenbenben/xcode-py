@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,19 +11,13 @@ from typing import Any
 
 @dataclass(slots=True)
 class ToolContext:
-    """工具执行上下文。
-
-    workspace 必填；data_home / ask_permission 由运行时注入。
-    ask_permission：高危工具执行前的审批回调，**仅当工具声明
-    requires_approval=True 时才会被运行时调用**；普通工具不询问。
-    回调为 None（如 -p 非交互模式未注入）时不询问、一律拒绝。
-    snapshot：本会话文件快照；write/edit 改盘前登记，revert_turn 从此读。
-    """
+    """workspace 必填。ask_permission 仅 requires_approval 工具会调；None 则拒绝。"""
 
     workspace: Path
     data_home: Path | None = None
     ask_permission: Callable[[str], Awaitable[bool]] | None = None
     snapshot: Any = None
+    code_index: Any = None
 
 
 @dataclass(slots=True)
@@ -71,3 +65,23 @@ def resolve_workspace_path(workspace: Path, raw: str) -> Path:
     except ValueError as exc:
         raise PermissionError(f"path outside workspace: {path}") from exc
     return path
+
+
+class ToolRegistry:
+    def __init__(self, tools: Iterable[Tool] | None = None) -> None:
+        self._tools: dict[str, Tool] = {}
+        if tools:
+            for tool in tools:
+                self.register(tool)
+
+    def register(self, tool: Tool) -> None:
+        self._tools[tool.name] = tool
+
+    def get(self, name: str) -> Tool | None:
+        return self._tools.get(name)
+
+    def list_names(self) -> list[str]:
+        return sorted(self._tools)
+
+    def openai_tools(self) -> list[dict]:
+        return [t.openai_schema() for t in self._tools.values()]

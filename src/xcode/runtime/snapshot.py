@@ -116,13 +116,8 @@ class SnapshotStore:
             self._write_record(self.root / _LAST, leftover, kind="last_turn")
 
     def begin_turn(self) -> None:
-        """新用户回合：清空本轮已备份集合。
-
-        若磁盘上还有未封存的 open_turn（上次崩溃），先封成 last_turn。
-        """
-        leftover = _read_json(self.root / _OPEN)
-        if leftover and leftover.get("files"):
-            self._write_record(self.root / _LAST, leftover, kind="last_turn")
+        """新用户回合：清空本轮已备份集合。崩溃残留的 open_turn 先封成 last_turn。"""
+        self._adopt_crashed_open()
         self._open_files = {}
         self._backed.clear()
         self._save_open()

@@ -342,7 +342,7 @@ def test_build_registry_includes_mcp_tools(tmp_path):
 
     async def _run() -> None:
         await mgr.start()
-        names = build_registry(tmp_path, extra_tools=mgr.tools()).list_names()
+        names = build_registry(extra_tools=mgr.tools()).list_names()
         assert "read_file" in names
         assert "mcp__github__list_issues" in names
         await mgr.aclose()
@@ -431,7 +431,6 @@ def test_run_agent_sends_mcp_schemas(tmp_path):
             "hi",
             config=config,
             session=session,
-            store=store,
             client=client,
             mcp_manager=mgr,
         ):

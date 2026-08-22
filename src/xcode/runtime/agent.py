@@ -1,24 +1,9 @@
-"""ReAct 主循环：调 LLM、执行工具、向外 yield 扁平产品事件。
-
-## 一轮用户请求在这里怎么走
-1. 用 build_context_bundle 拼 system（含 XCODE、memory_summary 等）
-2. ``session.append_message(user)`` — 立刻写入 transcript
-3. 循环最多 max_rounds 次：
-   a. **ensure_context_budget**：估算 system+tools+messages+reserve，超阈则 light_model 摘要 + apply_compact
-   b. 流式调用 chat.completions（messages = system + session.messages）
-   c. 若模型要 tool：append assistant(tool_calls) → 执行工具 → 每个结果 append tool 消息 → continue
-   d. 若纯文本：append assistant → DONE
-4. finally：write_context 落盘送模缓存
-
-## 与会话模块的约定
-- 所有对话消息只通过 session.append_message，禁止直接改 messages 列表（tool 循环内也一样）
-- compact 可在「用户轮第一次送模前」和「每个 tool 后再送模前」触发，避免单轮多 tool 撑爆窗口
-"""
+"""ReAct 主循环：调 LLM、执行工具、yield 扁平产品事件。消息只经 session.append_message。"""
 
 from __future__ import annotations
 
-import json
 import asyncio
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -39,12 +24,11 @@ from xcode.runtime.events import (
     make_event,
     map_finish_reason,
 )
-from xcode.runtime.session import SessionRuntime, SessionStore
+from xcode.runtime.session import SessionRuntime
 from xcode.runtime.snapshot import SnapshotStore
 from xcode.runtime.tokens import count_messages_tokens, count_text_tokens
-from xcode.tools.base import ToolContext
+from xcode.tools.base import ToolContext, ToolRegistry
 from xcode.tools.builtins import builtin_tools
-from xcode.tools.registry import ToolRegistry
 
 _COMPACT_SYSTEM = """你是会话交接摘要器。根据对话历史写一份简洁 handoff summary，供后续 agent 继续工作。
 要求：
@@ -55,11 +39,7 @@ _COMPACT_SYSTEM = """你是会话交接摘要器。根据对话历史写一份�
 只输出摘要正文，不要前言。"""
 
 
-def build_registry(
-    workspace=None, *, package_skills=None, extra_tools=None
-) -> ToolRegistry:
-    """组装工具表：内置 + 可选 MCP 等 extra。"""
-    _ = workspace, package_skills
+def build_registry(*, extra_tools=None) -> ToolRegistry:
     tools = list(builtin_tools())
     if extra_tools:
         tools.extend(extra_tools)
@@ -337,23 +317,18 @@ async def run_agent(
     *,
     config: Config,
     session: SessionRuntime,
-    store: SessionStore,
     client: Any | None = None,
     ask_permission: Callable[[str], Awaitable[bool]] | None = None,
     cancel_event: asyncio.Event | None = None,
     mcp_manager: Any | None = None,
+    code_index: Any | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """跑完一次用户请求的 ReAct，并流式产出产品事件。
-
-    cancel_event 被 set 后：停止后续模型请求与工具，已写入的 user 消息保留。
-    mcp_manager：已 start 的 MCP Client，其 tools() 并进 registry。
-    """
-    _ = store
+    """跑完一次用户请求的 ReAct，并流式产出产品事件。"""
     session.tool_prune_chars = config.tool_prune_chars
     session.transcript_hard_cap = config.transcript_hard_cap
     session.update_name_from_user_input(user_input)
     extra = mcp_manager.tools() if mcp_manager is not None else None
-    registry = build_registry(session.workspace_root, extra_tools=extra)
+    registry = build_registry(extra_tools=extra)
     llm = client or AsyncOpenAI(api_key=config.api_key or "missing", base_url=config.base_url)
     bundle = build_context_bundle(
         user_input=user_input,
@@ -371,6 +346,7 @@ async def run_agent(
         data_home=config.data_home,
         ask_permission=ask_permission,
         snapshot=snapshots,
+        code_index=code_index,
     )
     openai_tools = registry.openai_tools() or None
 

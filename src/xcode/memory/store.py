@@ -1,21 +1,4 @@
-"""长期记忆的磁盘层：只负责路径与文件读写，不调 LLM。
-
-## 目录布局
-  {data_home}/projects/{project_key}/memories/
-    memory_summary.md     # 极短总览；注入 system；首行 v1
-    MEMORY.md             # 可搜索注册表（主题 / keywords / 指针）
-    raw_memories.md       # stage1 追加的原始 bullets 流水
-    rollout_summaries/    # 单轮摘要文件，MEMORY 可引用其相对路径
-
-## 谁写什么
-- stage1（pipeline）：append_raw、write_rollout
-- stage2（pipeline）：atomic_write(MEMORY)、atomic_write(summary)
-- 人类约定：写工作区 XCODE.md，不要手改 memories 当规范
-- clear：删目录内容后 ensure_layout 重建空模板
-
-## 读路径安全
-resolve_rel 拒绝绝对路径与 ``..``，保证工具只能摸到 memories 根下。
-"""
+"""长期记忆磁盘层：memories/ 下的 Markdown 读写，不调 LLM。"""
 
 from __future__ import annotations
 

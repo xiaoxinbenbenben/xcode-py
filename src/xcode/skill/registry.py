@@ -29,7 +29,6 @@ class Skill:
     body: str
     source: str
     enabled: bool
-    mtime: float
 
 
 @dataclass(slots=True)
@@ -288,10 +287,6 @@ def _load_skill_file(path: Path, source: str, disabled: set[str]) -> Skill | Non
         return None
     if name != path.parent.name:
         return None
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        mtime = 0.0
     return Skill(
         name=name,
         description=description,
@@ -300,7 +295,6 @@ def _load_skill_file(path: Path, source: str, disabled: set[str]) -> Skill | Non
         body=body,
         source=source,
         enabled=name not in disabled,
-        mtime=mtime,
     )
 
 

@@ -11,18 +11,7 @@ from dotenv import load_dotenv
 
 @dataclass(slots=True)
 class Config:
-    """Agent 运行所需的配置快照（环境变量见 load_config / .env.example）。
-
-    LLM：api_key / base_url / model / light_model
-    路径：data_home（会话 + 记忆落盘根目录，默认 ~/.xcode）
-    会话窗口（会话/历史子系统）：
-      context_window          标称上下文长度，默认 256k
-      compact_threshold       达到 window 的该比例则 compact，默认 0.7
-      reserved_output_tokens  预算里预留给模型输出，默认 8k
-      tool_prune_chars        送模时单条 tool 输出保留字符数
-      transcript_hard_cap     JSONL 单事件硬顶（超则标记 truncated）
-    light_model 同时用于：长期记忆 stage1/2、会话 compact 摘要。
-    """
+    """LLM + 数据目录 + 窗口预算。环境变量见 load_config / .env.example。"""
 
     api_key: str
     base_url: str
@@ -101,21 +90,12 @@ def load_config(
 
     data_home = Path(os.getenv("XCODE_HOME", str(default_data_home()))).expanduser()
 
-    def _int(name: str, default: int) -> int:
+    def _num(name: str, default, conv):
         raw = os.getenv(name, "").strip()
         if not raw:
             return default
         try:
-            return int(raw)
-        except ValueError:
-            return default
-
-    def _float(name: str, default: float) -> float:
-        raw = os.getenv(name, "").strip()
-        if not raw:
-            return default
-        try:
-            return float(raw)
+            return conv(raw)
         except ValueError:
             return default
 
@@ -127,9 +107,9 @@ def load_config(
             "OPENAI_LIGHT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         ).strip(),
         data_home=data_home,
-        context_window=_int("XCODE_CONTEXT_WINDOW", 256_000),
-        compact_threshold=_float("XCODE_COMPACT_THRESHOLD", 0.7),
-        reserved_output_tokens=_int("XCODE_RESERVED_OUTPUT_TOKENS", 8192),
-        tool_prune_chars=_int("XCODE_TOOL_PRUNE_CHARS", 16_000),
-        transcript_hard_cap=_int("XCODE_TRANSCRIPT_HARD_CAP", 2_000_000),
+        context_window=_num("XCODE_CONTEXT_WINDOW", 256_000, int),
+        compact_threshold=_num("XCODE_COMPACT_THRESHOLD", 0.7, float),
+        reserved_output_tokens=_num("XCODE_RESERVED_OUTPUT_TOKENS", 8192, int),
+        tool_prune_chars=_num("XCODE_TOOL_PRUNE_CHARS", 16_000, int),
+        transcript_hard_cap=_num("XCODE_TRANSCRIPT_HARD_CAP", 2_000_000, int),
     )

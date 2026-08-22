@@ -361,7 +361,8 @@ def _validate_public_url(url: str) -> None:
     except ValueError:
         ip = None  # 非字面 IP，走域名解析
     if ip is not None:
-        _reject_private_ip(ip)
+        if _is_internal_address(ip):
+            raise NetworkPolicyError(f"URL resolves to a non-public address: {ip}")
         return
     try:
         infos = socket.getaddrinfo(host, None)
@@ -372,15 +373,11 @@ def _validate_public_url(url: str) -> None:
             ip = ipaddress.ip_address(info[4][0])
         except ValueError:
             continue
-        _reject_private_ip(ip)
+        if _is_internal_address(ip):
+            raise NetworkPolicyError(f"URL resolves to a non-public address: {ip}")
 
 
 _FAKE_IP_RANGE = ipaddress.ip_network("198.18.0.0/15")
-
-
-def _reject_private_ip(ip) -> None:
-    if _is_internal_address(ip):
-        raise NetworkPolicyError(f"URL resolves to a non-public address: {ip}")
 
 
 def _is_internal_address(ip) -> bool:

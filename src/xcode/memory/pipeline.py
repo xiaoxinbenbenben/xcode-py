@@ -1,35 +1,10 @@
-"""长期记忆写入管线：对话轮次 → stage1 抽取 → 防抖 stage2 合并。
-
-## 端到端时序（TUI 一轮结束后）
-1. tui 调用 slice_round(session.messages) 切出「最后一个 user 及其后」的快照
-2. should_extract 过滤寒暄/过短轮
-3. PipelineRegistry.for_workspace → MemoryPipeline.submit 入队
-4. 后台 worker 取批（一次尽量掏空队列合并多轮）：
-   a. stage1 LLM → bullets + rollout_summary
-   b. 密钥黑名单过滤
-   c. 写 rollout 文件（可选）+ append raw_memories
-   d. 拼一条 signal 放进 pending_signals
-   e. 若 pending ≥3 → 立刻 stage2；否则 arm 5 分钟 idle 定时器
-5. stage2：读**完整** MEMORY + summary + 本批 signals → LLM → 原子写两文件
-   - 成功或 unchanged 才从 pending 丢掉对应 signals
-   - 失败/解析失败：**保留 pending**，等 drain 或下次再试
-6. 退出 TUI：registry.drain_all 有界重试强制 flush
-
-## 并发与 clear 安全
-- 每 workspace 一个 Pipeline（单 worker 串行），避免两路同时改 MEMORY
-- _epoch：/memory clear 时 +1 并清空 queue/pending；在途 stage1/2 看到 epoch 变了就丢弃写盘
-
-## 与会话历史
-stage1 吃的是**送模侧** messages（tool 可能已 prune），不是 JSONL 全文。
-这是有意的：记忆只要稳定事实，不需要巨型 tool 原文。
-"""
+"""长期记忆写入：stage1 抽取 → 防抖 stage2 合并。每 workspace 一条串行管线；clear 靠 epoch 作废在途写入。"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -200,7 +175,6 @@ class MemoryPipeline:
         self._worker: asyncio.Task | None = None
         self._idle_task: asyncio.Task | None = None
         self._pending_signals: list[str] = []
-        self._last_signal_at: float | None = None
         self._epoch = 0
 
     @property
@@ -210,14 +184,6 @@ class MemoryPipeline:
     @property
     def pending_signal_count(self) -> int:
         return len(self._pending_signals)
-
-    @property
-    def is_running(self) -> bool:
-        return self._worker is not None and not self._worker.done()
-
-    @property
-    def epoch(self) -> int:
-        return self._epoch
 
     def submit(self, item: RoundContent) -> None:
         """非阻塞入队；若 worker 没在跑则拉起。不在这里 await LLM。"""
@@ -232,7 +198,6 @@ class MemoryPipeline:
         """作废在途任务：清空 queue/pending，bump epoch（/memory clear 用）。"""
         self._epoch += 1
         self._pending_signals.clear()
-        self._last_signal_at = None
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
@@ -358,7 +323,6 @@ class MemoryPipeline:
         if epoch != self._epoch:
             return
         self._pending_signals.append(signal)
-        self._last_signal_at = time.monotonic()
         if len(self._pending_signals) >= self._consolidate_min_signals:
             await self._flush_consolidate()
         else:

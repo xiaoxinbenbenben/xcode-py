@@ -105,15 +105,15 @@ class McpClientManager:
 
     async def aclose(self) -> None:
         """关掉所有子进程 / HTTP session；出错吞掉，避免挡 TUI 退出。"""
-        handles = [s.handle for s in self._states.values() if s.handle is not None]
-        for handle in handles:
+        for state in self._states.values():
+            handle = state.handle
+            state.handle = None
+            if handle is None:
+                continue
             try:
                 await handle.aclose()
             except Exception:
                 pass
-            for state in self._states.values():
-                if state.handle is handle:
-                    state.handle = None
 
     async def _connect_one(self, spec: McpServerSpec) -> None:
         """连一台 server：成功则挂工具；异常记 failed，不进表。"""
@@ -181,7 +181,6 @@ class McpClientManager:
         """闭包：把模型参数转成该 server 上的 tools/call。"""
 
         async def handler(args: dict[str, Any]) -> ToolResult:
-            """execute 入口：转发到 tools/call。"""
             return await self._invoke(server, lambda h: h.call_tool(remote_name, args))
 
         return handler
@@ -192,11 +191,9 @@ class McpClientManager:
         """虚工具：内部打 resources/list，拼成纯文本。"""
 
         async def handler(args: dict[str, Any]) -> ToolResult:
-            """execute 入口：不读 args，列出该 server 的 resources。"""
             _ = args
 
             async def op(handle: McpHandle) -> ToolResult:
-                """一次 resources/list；server 未实现则当空，不拆连接。"""
                 try:
                     items = await handle.list_resources()
                 except Exception as exc:
@@ -216,7 +213,6 @@ class McpClientManager:
         """虚工具：内部打 resources/read；缺 uri 直接报错。"""
 
         async def handler(args: dict[str, Any]) -> ToolResult:
-            """execute 入口：校验 uri 后打 resources/read。"""
             uri = args.get("uri")
             if not isinstance(uri, str) or not uri.strip():
                 return ToolResult("read_resource error: uri is required", is_error=True)

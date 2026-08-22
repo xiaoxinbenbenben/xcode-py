@@ -117,7 +117,6 @@ def main(
                 prompt,
                 config=config,
                 session=runtime,
-                store=store,
                 json_events=json_events,
             )
         )

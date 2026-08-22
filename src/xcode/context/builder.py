@@ -1,20 +1,10 @@
-"""组装每轮发给模型的 system / user 文本（不负责会话落盘）。
-
-## 本轮上下文从哪来
-- system：身份准则 + 工作区 XCODE.md/XCODE.local.md + **长期记忆 summary 段** + skills catalog
-- user_text：用户原文（不改写、不注入文件）
-- history：调用方传入的 session.messages 快照（实际送模仍以 session.messages 为准）
-
-长期记忆：只通过 summary_prompt_block 注入短 summary，细节靠 memory_* 工具。
-会话压缩（compact）在 runtime.session / agent 里做，不在本文件。
-"""
+"""组装发给模型的 system 文本（身份 / XCODE / 仓库地图 / memory_summary / skills）。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 from xcode.memory import MemoryStore, summary_prompt_block
 from xcode.runtime.session import SessionRuntime
@@ -28,7 +18,6 @@ _PROJECT_TOTAL_LIMIT = 8000
 class ContextBundle:
     system: str
     user_text: str
-    history: list[dict[str, Any]]
 
 
 def _read_optional(path: Path, *, limit: int = _PROJECT_FILE_LIMIT) -> str:
@@ -88,11 +77,23 @@ def assemble_system_prompt(
             "bash 留给测试、git、构建。用户要求撤回上一轮文件改动时用 revert_turn。",
             "- 任务明显匹配 Available skills 中某条时，先 load_skill 再按说明书做；不要一次预载全部。"
             "说明书里的相对路径以 Base directory 为根，用 read_file 读文档、bash 跑脚本。",
+            "- 找函数、类、方法名用 search_code；找字符串或正则用 grep。"
+            "未覆盖的语言、注释和字符串字面量仍用 grep。",
         ]
     )
     project = _project_memory(workspace)
     if project:
         parts.extend(["", "项目说明：", project])
+    if data_home is not None:
+        from xcode.code_index import CodeIndexStore, render_repo_map
+
+        index = CodeIndexStore(data_home, workspace)
+        try:
+            repo_map = render_repo_map(index)
+        finally:
+            index.close()
+        if repo_map:
+            parts.extend(["", "仓库地图：", repo_map])
     # 长期记忆：仅 summary + 读指引（见 memory.store.summary_prompt_block）
     if data_home is not None:
         store = MemoryStore(data_home, workspace)
@@ -126,5 +127,4 @@ def build_context_bundle(
     return ContextBundle(
         system=system,
         user_text=user_input,
-        history=list(session.messages),
     )

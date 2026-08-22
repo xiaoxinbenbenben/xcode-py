@@ -8,8 +8,7 @@ import json
 from xcode.audit import audit_path
 from xcode.runtime.agent import _iter_tool_executions
 from xcode.runtime.session import SessionStore
-from xcode.tools.base import Tool, ToolContext, ToolResult
-from xcode.tools.registry import ToolRegistry
+from xcode.tools.base import Tool, ToolContext, ToolRegistry, ToolResult
 
 
 class _DangerTool(Tool):

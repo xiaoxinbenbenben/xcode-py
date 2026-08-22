@@ -23,6 +23,7 @@ SLASH_ITEMS: tuple[tuple[str, str], ...] = (
     ("/memory", "读或清空项目记忆"),
     ("/skills", "技能名单 / 启停 / 加载"),
     ("/mcp", "MCP server 状态"),
+    ("/index", "代码索引状态"),
     ("/exit", "退出"),
     ("/quit", "退出"),
 )

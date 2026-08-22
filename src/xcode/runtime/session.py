@@ -1,40 +1,4 @@
-"""会话 / 历史：transcript 权威流水 + context 送模缓存。
-
-## 要解决什么
-1. **可恢复**：进程退出或崩溃后，还能用同一 session_id 续聊。
-2. **长会话不炸**：工具输出截断（prune）+ 上下文压缩（compact），控制送进模型的窗口。
-
-## 磁盘布局（每个 session 一个目录）
-  {data_home}/projects/{project_key}/sessions/{session_id}/
-    meta.json            # 名片：id、标题、workspace、时间
-    transcript.jsonl     # 权威：只追加事件（message / compact）
-    context.json         # 缓存：当前送模 messages + 书签（byte_offset 等）
-    snapshots/           # write/edit 文件快照（见 runtime/snapshot.py）
-  同级 current_session.json  # 项目「上次打开的是哪个 session」
-
-## 两条数据路径（必须分清）
-- **transcript**：发生过的事（审计/重建）。尽量保留全文；触硬顶会标记 truncated。
-- **messages / context**：下一轮 API 真正吃的窗口。tool 内容会 prune；compact 后变成
-  [摘要消息] + 近端若干 user turn group。
-
-## 写入时序（正常一轮对话）
-1. agent 每产生一条 user/assistant/tool → 只走 ``append_message``：
-   - 分配单调 event_id
-   - 追加一行 JSONL 并 flush
-   - 把 **prune 后** 的消息放进内存 messages
-2. 即将调用模型前（agent 里）：若 token 超阈 → ``apply_compact`` 再请求
-3. 整轮结束：``write_context`` 原子写 context.json + meta（书签 = 当前文件字节偏移）
-
-## Resume（load）
-1. 有 context 且文件大小 == byte_offset、id/count 对得上 → 直接用缓存 messages
-2. 文件比 offset 更长 → 只解析尾巴，增量合并
-3. 否则 / context 坏了 → 从「最后一个 compact 事件」重建（不必重放 compact 前全文）
-4. JSONL 最后一行不是完整 JSON → 当作写崩半行，丢弃
-
-## 与长期记忆的边界
-本模块只管「这一场聊」；跨会话事实在 ``xcode.memory``，互不替代。
-详见 docs/session-history.md。
-"""
+"""会话历史：transcript.jsonl 权威流水 + context.json 送模缓存。见 docs/session-history.md。"""
 
 from __future__ import annotations
 
@@ -116,8 +80,12 @@ def _maybe_hard_cap(content: str, *, hard_cap: int) -> tuple[str, bool, int, int
         return content, False, original, original
     return content[:hard_cap], True, original, hard_cap
 
-def openai_message_for_memory(msg: dict[str, Any]) -> dict[str, Any]:
-    """拷贝为可送模的 message（浅拷贝字段）。"""
+def prune_message_for_model(
+    msg: dict[str, Any],
+    *,
+    tool_prune_chars: int = DEFAULT_TOOL_PRUNE_CHARS,
+) -> dict[str, Any]:
+    """生成送模用消息：tool content 截断，其它原样。"""
     out: dict[str, Any] = {"role": msg["role"]}
     if "content" in msg:
         out["content"] = msg["content"]
@@ -127,19 +95,39 @@ def openai_message_for_memory(msg: dict[str, Any]) -> dict[str, Any]:
         out["tool_call_id"] = msg["tool_call_id"]
     if msg.get("name") is not None:
         out["name"] = msg["name"]
-    return out
-
-
-def prune_message_for_model(
-    msg: dict[str, Any],
-    *,
-    tool_prune_chars: int = DEFAULT_TOOL_PRUNE_CHARS,
-) -> dict[str, Any]:
-    """生成送模用消息：tool content 截断，其它原样。"""
-    out = openai_message_for_memory(msg)
     if out.get("role") == "tool" and isinstance(out.get("content"), str):
         out["content"] = prune_tool_content(out["content"], limit=tool_prune_chars)
     return out
+
+
+def _user_previews(messages: list[Any]) -> list[str]:
+    previews: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or content.startswith("<compact_summary>"):
+            continue
+        previews.append(" ".join(content.split()))
+    return previews
+
+
+def _parse_jsonl(text: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            if i == len(lines) - 1:
+                break
+            continue
+        if isinstance(obj, dict):
+            events.append(obj)
+    return events
 
 
 def split_user_turn_groups(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -177,11 +165,7 @@ def retain_last_user_groups(
     groups = split_user_turn_groups(messages)
     if not groups:
         return []
-    kept = groups[-n:]
-    out: list[dict[str, Any]] = []
-    for g in kept:
-        out.extend(g)
-    return out
+    return [msg for group in groups[-n:] for msg in group]
 
 
 def summary_message(summary: str) -> dict[str, Any]:
@@ -326,16 +310,8 @@ class SessionRuntime:
 
     def refresh_meta_stats(self) -> None:
         """用当前送模窗口刷新列表要用的轮次 / 预览。"""
-
         self.meta.message_count = len(self.messages)
-        previews: list[str] = []
-        for msg in self.messages:
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content")
-            if not isinstance(content, str) or content.startswith("<compact_summary>"):
-                continue
-            previews.append(" ".join(content.split()))
+        previews = _user_previews(self.messages)
         self.meta.user_turns = len(previews)
         self.meta.preview = (previews[-1] if previews else "")[:80]
 
@@ -468,9 +444,6 @@ class SessionRuntime:
         self.messages = new_messages
         self.estimated_tokens = event["estimated_tokens"]
 
-    def estimate_message_tokens(self, *, model: str = "") -> int:
-        return count_messages_tokens(self.messages, model=model)
-
     def needs_compact(
         self,
         *,
@@ -480,17 +453,11 @@ class SessionRuntime:
         reserved_output_tokens: int,
         model: str = "",
     ) -> bool:
-        """判断「再请求模型是否会顶满窗口」。
-
-        预算 = 固定前缀(overhead：system/tools 等) + 当前 messages + 预留给模型输出的 reserve。
-        当 budget >= context_window * threshold 时返回 True。
-        真正调用 LLM 生成摘要在 agent.ensure_context_budget，不在本方法里。
-        """
+        """budget = overhead + messages + reserve；>= window * threshold 则该 compact。"""
         if context_window <= 0:
             return False
-        used = overhead_tokens + self.estimate_message_tokens(model=model)
-        limit = int(context_window * compact_threshold)
-        return (used + reserved_output_tokens) >= limit
+        used = overhead_tokens + count_messages_tokens(self.messages, model=model)
+        return (used + reserved_output_tokens) >= int(context_window * compact_threshold)
 
     # --- 加载 / 回放 ---
 
@@ -500,50 +467,17 @@ class SessionRuntime:
         if not path.is_file():
             return []
         raw = path.read_bytes()
-        if not raw:
-            return []
-        text = raw.decode("utf-8", errors="replace")
-        lines = text.splitlines()
-        events: list[dict[str, Any]] = []
-        for i, line in enumerate(lines):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                if i == len(lines) - 1:
-                    break  # 半行
-                continue
-            if isinstance(obj, dict):
-                events.append(obj)
-        return events
+        return _parse_jsonl(raw.decode("utf-8", errors="replace")) if raw else []
 
     @staticmethod
     def _events_from_offset(path: Path, offset: int) -> list[dict[str, Any]]:
         if not path.is_file() or offset < 0:
             return []
-        size = path.stat().st_size
-        if offset >= size:
+        if offset >= path.stat().st_size:
             return []
         with path.open("rb") as fh:
             fh.seek(offset)
-            chunk = fh.read().decode("utf-8", errors="replace")
-        events: list[dict[str, Any]] = []
-        lines = chunk.splitlines()
-        for i, line in enumerate(lines):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                if i == len(lines) - 1:
-                    break
-                continue
-            if isinstance(obj, dict):
-                events.append(obj)
-        return events
+            return _parse_jsonl(fh.read().decode("utf-8", errors="replace"))
 
     def _message_from_event(
         self, event: dict[str, Any], *, for_model: bool
@@ -807,14 +741,7 @@ class SessionStore:
         if not isinstance(messages, list):
             return
         meta.message_count = len(messages)
-        previews: list[str] = []
-        for msg in messages:
-            if not isinstance(msg, dict) or msg.get("role") != "user":
-                continue
-            content = msg.get("content")
-            if not isinstance(content, str) or content.startswith("<compact_summary>"):
-                continue
-            previews.append(" ".join(content.split()))
+        previews = _user_previews(messages)
         meta.user_turns = len(previews)
         if previews and not meta.preview:
             meta.preview = previews[-1][:80]

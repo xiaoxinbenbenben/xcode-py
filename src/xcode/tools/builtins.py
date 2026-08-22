@@ -1,8 +1,7 @@
 """内置工具表（todo #7 按目标清单回填）。
 
 所有 execute 均为 async（供子进程 / HTTP 类工具复用）。
-已实现：read_file / write_file / edit_file / list_dir / glob / grep / bash / web_search / web_fetch / memory_read / memory_grep / revert_turn
-待回填：search_code
+已实现：read_file / write_file / edit_file / list_dir / glob / grep / bash / web_search / web_fetch / memory_read / memory_grep / revert_turn / search_code
 """
 
 from __future__ import annotations
@@ -113,9 +112,42 @@ def _rel(ctx: ToolContext, path) -> str:
     return path.relative_to(ctx.workspace.resolve()).as_posix()
 
 
+async def _refresh_index(ctx: ToolContext, *paths: Path) -> None:
+    """写盘成功后增量更新代码索引；没有管理器则跳过。"""
+    indexer = getattr(ctx, "code_index", None)
+    if indexer is None or not paths:
+        return
+    await indexer.refresh_paths(list(paths))
+
+
 def _has_ignored_segment(rel: Path) -> bool:
     """相对路径任一段是否属于默认隐藏名。"""
     return any(part in _DEFAULT_HIDDEN_BASENAMES for part in rel.parts)
+
+
+def _int_arg(
+    args: dict[str, Any],
+    key: str,
+    default: int,
+    tool_name: str,
+    *,
+    lo: int = 1,
+    hi: int = _MAX_LIMIT,
+) -> int | ToolResult:
+    try:
+        value = int(args.get(key) or default)
+    except (TypeError, ValueError):
+        return ToolResult(f"{tool_name} error: {key} must be a number", is_error=True)
+    return max(lo, min(value, hi))
+
+
+def _bool_arg(
+    args: dict[str, Any], key: str, tool_name: str, default: bool = False
+) -> bool | ToolResult:
+    value = args.get(key, default)
+    if not isinstance(value, bool):
+        return ToolResult(f"{tool_name} error: {key} must be a boolean", is_error=True)
+    return value
 
 class ReadFileTool(Tool):
     name = "read_file"
@@ -210,6 +242,7 @@ class WriteFileTool(Tool):
         except OSError as exc:
             return ToolResult(f"write_file error: {exc}", is_error=True)
 
+        await _refresh_index(ctx, path)
         return ToolResult(f"Wrote {_rel(ctx, path)}")
 
 
@@ -273,6 +306,7 @@ class EditFileTool(Tool):
         except OSError as exc:
             return ToolResult(f"edit_file error: {exc}", is_error=True)
 
+        await _refresh_index(ctx, path)
         return ToolResult(f"Updated {_rel(ctx, path)}")
 
 
@@ -312,15 +346,12 @@ class ListDirTool(Tool):
         if not path.is_dir():
             return ToolResult(f"list_dir error: not a directory: {raw}", is_error=True)
 
-        include_ignored = args.get("include_ignored", False)
-        if not isinstance(include_ignored, bool):
-            return ToolResult("list_dir error: include_ignored must be a boolean", is_error=True)
-
-        try:
-            limit = int(args.get("limit") or _DEFAULT_LIMIT)
-        except (TypeError, ValueError):
-            return ToolResult("list_dir error: limit must be a number", is_error=True)
-        limit = max(1, min(limit, _MAX_LIMIT))
+        include_ignored = _bool_arg(args, "include_ignored", self.name)
+        if isinstance(include_ignored, ToolResult):
+            return include_ignored
+        limit = _int_arg(args, "limit", _DEFAULT_LIMIT, self.name)
+        if isinstance(limit, ToolResult):
+            return limit
 
         try:
             entries = [
@@ -376,15 +407,12 @@ class GlobTool(Tool):
                 is_error=True,
             )
 
-        include_ignored = args.get("include_ignored", False)
-        if not isinstance(include_ignored, bool):
-            return ToolResult("glob error: include_ignored must be a boolean", is_error=True)
-
-        try:
-            limit = int(args.get("limit") or _DEFAULT_LIMIT)
-        except (TypeError, ValueError):
-            return ToolResult("glob error: limit must be a number", is_error=True)
-        limit = max(1, min(limit, _MAX_LIMIT))
+        include_ignored = _bool_arg(args, "include_ignored", self.name)
+        if isinstance(include_ignored, ToolResult):
+            return include_ignored
+        limit = _int_arg(args, "limit", _DEFAULT_LIMIT, self.name)
+        if isinstance(limit, ToolResult):
+            return limit
 
         # --- 2) 匹配 → 仅文件 → 过滤噪音 / 越界 ---
         root = ctx.workspace.resolve()
@@ -416,6 +444,7 @@ class GrepTool(Tool):
     name = "grep"
     description = (
         "Search text in workspace files with a regex pattern. "
+        "Use search_code to look up function/class/method names. "
         "Skips .git, node_modules, __pycache__, and .venv unless include_ignored=true."
     )
     parameters = {
@@ -458,15 +487,12 @@ class GrepTool(Tool):
         if not start.exists():
             return ToolResult(f"grep error: path not found: {raw_path}", is_error=True)
 
-        include_ignored = args.get("include_ignored", False)
-        if not isinstance(include_ignored, bool):
-            return ToolResult("grep error: include_ignored must be a boolean", is_error=True)
-
-        try:
-            limit = int(args.get("limit") or _DEFAULT_LIMIT)
-        except (TypeError, ValueError):
-            return ToolResult("grep error: limit must be a number", is_error=True)
-        limit = max(1, min(limit, _MAX_LIMIT))
+        include_ignored = _bool_arg(args, "include_ignored", self.name)
+        if isinstance(include_ignored, ToolResult):
+            return include_ignored
+        limit = _int_arg(args, "limit", _DEFAULT_LIMIT, self.name)
+        if isinstance(limit, ToolResult):
+            return limit
 
         # --- 2) 收文件列表：单文件直搜，目录 rglob 过滤隐藏段（尊重显式 path）---
         root = ctx.workspace.resolve()
@@ -599,11 +625,9 @@ class WebSearchTool(Tool):
         query = args.get("query")
         if not isinstance(query, str) or not query.strip():
             return ToolResult("web_search error: query is required", is_error=True)
-        try:
-            max_results = int(args.get("max_results") or 5)
-        except (TypeError, ValueError):
-            return ToolResult("web_search error: max_results must be a number", is_error=True)
-        max_results = max(1, min(max_results, 20))
+        max_results = _int_arg(args, "max_results", 5, self.name, hi=20)
+        if isinstance(max_results, ToolResult):
+            return max_results
 
         try:
             results = await search_web(query, max_results=max_results)
@@ -638,11 +662,9 @@ class WebFetchTool(Tool):
         url = args.get("url")
         if not isinstance(url, str) or not url.strip():
             return ToolResult("web_fetch error: url is required", is_error=True)
-        try:
-            max_length = int(args.get("max_length") or 10_000)
-        except (TypeError, ValueError):
-            return ToolResult("web_fetch error: max_length must be a number", is_error=True)
-        max_length = max(1, min(max_length, 100_000))
+        max_length = _int_arg(args, "max_length", 10_000, self.name, hi=100_000)
+        if isinstance(max_length, ToolResult):
+            return max_length
 
         try:
             text = await fetch_url(url, max_length=max_length)
@@ -765,6 +787,38 @@ class LoadSkillTool(Tool):
         return ToolResult(text)
 
 
+class SearchCodeTool(Tool):
+    name = "search_code"
+    description = (
+        "Find function, class, or method symbols by name (exact match first, then prefix). "
+        "Use grep for string or regex search."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Symbol name to look up"},
+        },
+        "required": ["name"],
+    }
+
+    async def execute(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        name = args.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return ToolResult("search_code error: name is required", is_error=True)
+        indexer = getattr(ctx, "code_index", None)
+        if indexer is not None:
+            return ToolResult(indexer.store.search_code(name.strip()))
+        if ctx.data_home is None:
+            return ToolResult("search_code: index not ready; use grep")
+        from xcode.code_index import CodeIndexStore
+
+        store = CodeIndexStore(ctx.data_home, ctx.workspace)
+        try:
+            return ToolResult(store.search_code(name.strip()))
+        finally:
+            store.close()
+
+
 class RevertTurnTool(Tool):
     """把上一轮 write_file/edit_file 改过的文件退回改前；不改对话。"""
 
@@ -790,6 +844,11 @@ class RevertTurnTool(Tool):
         text = report.format()
         if text == "nothing to restore":
             return ToolResult("revert_turn: nothing to revert (no last-turn snapshot)")
+        changed = [
+            ctx.workspace / rel
+            for rel in [*report.restored, *report.deleted]
+        ]
+        await _refresh_index(ctx, *changed)
         return ToolResult(f"revert_turn:\n{text}")
 
 
@@ -809,4 +868,5 @@ def builtin_tools() -> list[Tool]:
         MemoryGrepTool(),
         LoadSkillTool(),
         RevertTurnTool(),
+        SearchCodeTool(),
     ]

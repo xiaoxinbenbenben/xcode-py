@@ -175,3 +175,52 @@ bash
   → 只打印配置里的 server、连没连上、工具数、错误
 ```
 
+## 代码索引
+
+拍板：2026-08-20。tree-sitter 抽定义/调用 → sqlite；按入边引用给文件打分；每轮现拼约 1500 token 的仓库地图进 system；`search_code` 按符号名查表。不做向量 RAG。`grep` / `glob` 继续活着。
+
+### 决策表
+
+| 决策点           | 选定方案                                                   | 说明                                                                              |
+| ------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| 出口            | 双出口                                                    | map 进 system；`search_code` 查表。磁盘只留 sqlite，不写 `repomap.txt`                      |
+| 落盘            | `{data_home}/projects/{project_key}/code-index.sqlite` | schema 对不上：删库重建                                                                 |
+| 抽取            | 定义 + 调用                                                | 定义 = 函数 / 类 / 方法（方法记所属类）。import、裸变量名不算引用                                        |
+| 打分            | 跨文件「源文件 × 符号」各 +1                                      | 同文件调用不计分，但 `search_code` 仍展示。对不上定义的调用丢掉                                         |
+| map 选文件       | 严格按分数从高到低                                              | 不为入口 / 零分文件留座                                                                   |
+| map 正文        | 路径 + 定义名                                               | 类下缩进方法，其余按源码顺序。不行号、不签名、不引用                                                      |
+| map 预算        | 约 1500 token                                           | `count_text_tokens`；不拆半个类。插在项目说明之后、记忆之前。没有或未就绪：整段省略                             |
+| `search_code` | 只收 `name`                                              | 先精确后前缀，大小写敏感。先定义后引用，各最多 20；精确占坑优先。超出 `… and N more`。方法展示 `Greeter.greet`，匹配仍用短名 |
+| 未就绪           | 立刻叫用 `grep`                                            | 不阻塞。工具始终注册，空表也在。只读，不审批                                                          |
+| 和 `grep`      | system 一条准则                                            | 找函数/类/方法名用 `search_code`；找字符串/正则用 `grep`。不禁止 `grep` 搜代码                         |
+| 语言            | `.py` `.js` `.ts` `.tsx` `.go` `.rs`                   | 其它语言和解析失败的文件跳过                                                                  |
+| 跳过            | glob/grep 四目录 + 生成物名单 + 1MB                            | 另跳 `dist`/`build`/`target`/`vendor`/常见 cache。不读 `.gitignore`。不设文件数上限            |
+| 何时建           | 进 TUI / `-p` 后台按 mtime 增量                              | parse 进线程，不卡输入框。边扫边可查。`--version` / `doctor` 不建                                 |
+| 增量            | 写工具成功后只重解析改过的                                          | `write_file` / `edit_file` / `revert_turn`。`bash` 改的等到下次启动                      |
+| 人入口           | `/index` 只看                                            | 文件数 / 符号数 / 上次扫描 / 失败数 / scanning\|ready。无 rebuild、无开关                          |
+| 依赖            | 官方 `tree-sitter` + 六个语言包                               | query 自己写。不绑 language-pack，不依赖 Aider                                            |
+
+### 调用链
+
+```
+进 TUI / 开始 -p
+  → 后台按 mtime 增量扫（parse 进线程）
+  → 命中语言白名单且未跳过的文件：tree-sitter 抽定义/调用 → sqlite
+  → 重算文件分；/index 标 scanning，已入库的可查
+  → 扫完：/index 标 ready
+
+每轮 assemble_system_prompt
+  → 从表按分数拼 map，裁到约 1500 token
+  → 有则插在项目说明后、记忆前；没有整段省略
+
+模型调 search_code({name})
+  → 精确命中优先，否则前缀；先 ≤20 定义再 ≤20 引用
+  → 索引未就绪：返回「用 grep」，不阻塞
+
+write_file / edit_file / revert_turn 成功
+  → 只重解析这几个文件，重算分
+
+/index
+  → 只打印文件数、符号数、上次扫描、失败数、scanning|ready
+```
+
